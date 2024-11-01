@@ -57,6 +57,14 @@ Summary
 """
 
 
+"""
+
+Major changes:
+
+- Removed unsafe usage of __dict__ (which is very dangerous when used without __slots__)
+"""
+
+
 
 
 @dataclass
@@ -105,12 +113,11 @@ class SessionApi:
     Solely focuses on interacting with the API
 
     Developer notes:
-        Need to clarify (and define) a standardized and consistent Api interface
+        Need to clarify (and define) a standardized and consistent Api interface.
         Session as a conceptual entity also wants to hold the HttpClient session to 
         ensure a standardized, consistent and predictable behavior
 
-
-        The way this can be approachedi s by having a base `Api` class that holds common
+        The way it can be approached is by having a base `Api` class that holds common
         configuration, while implementors provide entity-related controllers.
     """
     # TODO: Decouple standard Configuration into a more exact SessionConfiguration entity.
@@ -118,8 +125,7 @@ class SessionApi:
     # NOTE: pydantic-settings works beautifully in such setup, but it's not a requirement.
     config: Configuration 
 
-    @classmethod
-    def update_session(cls,session: SessionStruct) -> None:
+    def update_session(self,session: SessionStruct) -> None:
         try:
             payload = {"session": asdict(session)}
             res = HttpClient.post(
@@ -130,7 +136,9 @@ class SessionApi:
         except ApiServerException as e:
             return logger.error(f"Could not update session - {e}")
 
-    def _reauthorize_jwt(self) -> Union[str, None]:
+
+    # WARN: This method seems deprecated, it is not being used anywhere?
+    def reauthorize_jwt(self) -> Union[str, None]:
         payload = {"session_id": self.session_id}
         serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
         res = HttpClient.post(
