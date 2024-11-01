@@ -534,8 +534,7 @@ class Session(SessionStruct):
 
     def _publish(self):
         """Notify the ChangesObserverThread to perform the API call."""
-        with self.locks["events"]:
-            self.thread.condition.notify()
+        self.conditions["changes"].notify()
 
     @property
     def is_running(self):
@@ -621,12 +620,10 @@ class ChangesObserverThread(_SessionThread):
         Waits for a condition and performs API calls to publish events.
         """
         while self.running:
-            condition = self.s.conditions["changes"]
-            with condition:
-                # Wait for a notification from _publish
-                condition.wait()
-                # Perform the API call to publish events using SessionApi
-                self._perform_api_call()
+            with (condition := self.s.conditions["changes"]):
+                condition.wait()  # Wait for a notification from _publish
+
+                self._perform_api_call()  # Perform the API call to publish events using SessionApi
 
     def _perform_api_call(self) -> None:
         """
