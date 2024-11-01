@@ -6,8 +6,18 @@ import queue
 import threading
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from typing import (Annotated, Any, Dict, Iterable, List, Literal, Optional,
-                    Protocol, Union, runtime_checkable)
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
 from uuid import UUID, uuid4
 
 from termcolor import colored
@@ -58,7 +68,6 @@ Major changes:
 """
 
 
-
 @dataclass
 class EventsCounter:
     llms: int = 0
@@ -66,7 +75,6 @@ class EventsCounter:
     actions: int = 0
     errors: int = 0
     apis: int = 0
-
 
 
 # TODO: Ideally, we can have a custom list with counters builtin
@@ -80,6 +88,7 @@ class Counter(object):
     """
     Thread safe Counter
     """
+
     # TODO: Move to a separate, utilities module
 
     def __init__(self, value=0, mutex=None):
@@ -98,6 +107,7 @@ class Counter(object):
     def value(self):
         with self.mutex:
             return self.val
+
 
 @dataclass
 class SessionStruct:
@@ -295,6 +305,7 @@ class Session(SessionStruct):
     ]
 
     locks: Dict[Literal["lifecycle", "events", "session", "tags"], threading.Lock]
+    cconditions: Dict[Literal["changes"], threading.Condition]
 
     def __init__(
         self,
@@ -313,7 +324,9 @@ class Session(SessionStruct):
             self.locks[k] = threading.Lock()
 
         self.conditions = {
-            "cleanup": threading.Condition(self.locks['lifecycle']) # Share the same lifecycle lock
+            "cleanup": threading.Condition(
+                self.locks["lifecycle"]
+            )  # Share the same lifecycle lock
         }
 
         self.thread = EventPublisherThread(self)
@@ -366,7 +379,6 @@ class Session(SessionStruct):
 
         self.tags = tags
         self._publish()
-
 
     # --- Interactors
     def record(self, event: Union[Event, ErrorEvent]):
@@ -487,7 +499,9 @@ class Session(SessionStruct):
 
         return token_cost_d
 
-    def create_agent(self, name: str, agent_id: Optional[str] = None) -> object: # FIXME: Is this `int`, `UUID`, or `str`?
+    def create_agent(
+        self, name: str, agent_id: Optional[str] = None
+    ) -> object:  # FIXME: Is this `int`, `UUID`, or `str`?
         if not self.is_running:
             return
         if agent_id is None:
@@ -518,14 +532,14 @@ class Session(SessionStruct):
             self._flush_queue()
         self.condition.notify()
 
-
     def _publish(self):
-        """Notify the ChangesObserverThread to publish the events"""
+        """Notify the ChangesObserverThread to perform the API call."""
+        with self.locks["events"]:
+            self.thread.condition.notify()
 
     @property
     def is_running(self):
         pass
-
 
     def stop(self):
         pass
@@ -533,60 +547,52 @@ class Session(SessionStruct):
     def pause(self):  # Concept
         raise NotImplementedError
 
-    def _cleanup(self):
-        """
-        Ensure the cleanup of the session.
+    # def _cleanup(self):
+    #     """
+    #     Ensure the cleanup of the session.
+    #
+    #     This method can run once per runtime to ensure that the session is properly cleaned up.
+    #     Once the cleanup_event has occurred, it can be assumed that the session is no longer running.
+    #     """
+    #     # :: Try to acquire the runtime lock, but don't Block if it is not free
+    #     # :: There is no reason to block because there's no reason to stack such events
+    #
+    #     to_be_decided = object
+    #
+    #     if not self.locks.acquire(blocking=False):
+    #         # We can't perform a cleanup if there's no runtime
+    #         # return self.thread.join()
+    #         pass
+    #     try:
+    #         # if not self.
+    #         # if self.is_running and not self.end_timestamp: # Why do we need to check for the end_timestamp though?
+    #         # self.stop_flag.set() # FIXME: Does it need to show running?
+    #         self.dispatch()
+    #         try:
+    #             self.terminate(
+    #                 end_state="Indeterminate",
+    #                 end_state_reason="Session interrupted",
+    #             )
+    #         except:
+    #             pass
+    #
+    #         self.cleanup_condition.notify()
+    #
+    #         # self._cleanup_done = True
+    #         # self.is_running = False
+    #     finally:
+    #         if acquired:
+    #             self.condition.release()
 
-        This method can run once per runtime to ensure that the session is properly cleaned up.
-        Once the cleanup_event has occurred, it can be assumed that the session is no longer running.
-        """
-        # :: Try to acquire the runtime lock, but don't Block if it is not free
-        # :: There is no reason to block because there's no reason to stack such events
 
-        to_be_decided = object
-        
-        if not self.locks.acquire(blocking=False):
-            # We can't perform a cleanup if there's no runtime
-            # return self.thread.join()
-            pass
-        try:
-            # if not self.
-            # if self.is_running and not self.end_timestamp: # Why do we need to check for the end_timestamp though?
-            # self.stop_flag.set() # FIXME: Does it need to show running?
-            self.dispatch()
-            try:
-                self.terminate(
-                    end_state="Indeterminate",
-                    end_state_reason="Session interrupted",
-                )
-            except:
-                pass
-
-            self.cleanup_condition.notify()
-
-            # self._cleanup_done = True
-            # self.is_running = False
-        finally:
-            if acquired:
-                self.condition.release()
-
-
-
-class ChangesObserverThread(threading.Thread):
-    pass
-    
-
-class EventPublisherThread(threading.Thread):
-    """Polls events from Session, publishes API batches"""
+class _SessionThread(threading.Thread):
+    """Base class for session-related threads."""
 
     def __init__(self, session: Session):
+        super().__init__()
         self.s = session
         self.daemon = True
         self.stop_requested = threading.Lock()
-
-    @property
-    def feed(self) -> queue.Queue:
-        return self.s._events
 
     @property
     def stopping(self) -> bool:
@@ -597,7 +603,7 @@ class EventPublisherThread(threading.Thread):
         return not self.stopping
 
     def stop(self) -> None:
-        with self.stop_requested:
+        with self.s.locks["lifecycle"]:
             with self.s.runtime_condition:
                 if not self.s._events:
                     self.s.runtime_condition.wait(
@@ -606,28 +612,55 @@ class EventPublisherThread(threading.Thread):
                 if self.s._events:
                     self.s._flush_queue()
 
+
+class ChangesObserverThread(_SessionThread):
+    """Observes changes in the session and performs API calls for event publishing."""
+
+    def run(self) -> None:
+        """
+        Waits for a condition and performs API calls to publish events.
+        """
+        while self.running:
+            condition = self.s.conditions["changes"]
+            with condition:
+                # Wait for a notification from _publish
+                condition.wait()
+                # Perform the API call to publish events using SessionApi
+                self._perform_api_call()
+
+    def _perform_api_call(self) -> None:
+        """
+        Performs the API call using SessionApi.
+        """
+        try:
+            # Example API call
+            self.session.api.update_session()
+            logger.info("Session updated successfully.")
+        except ApiServerException as e:
+            logger.error(f"Could not update session - {e}")
+
+
+class EventPublisherThread(_SessionThread):
+    """Polls events from Session, publishes API batches"""
+
+    @property
+    def feed(self) -> queue.Queue:
+        return self.s._events
+
     def run(self) -> None:  # virtual override
         """
         `threading.Thread` invokes this on Thread.start()
 
         Will poll for events
         """
-
         while True:
-            with self.poll
+            with self.poll:
                 if not self.s._events:
                     self.s.runtime_condition.wait(
                         timeout=self.s.config.max_wait_time / 1000
                     )
                 if self.s._events:
                     self.s._flush_queue()
-        # while self.running:
-        #     with self.condition:
-        #         pass
-        # if not self.events_buffer:
-        #     self.condition.wait(timeout=self.config.max_wait_time / 1000)
-        # if self.events_buffer:
-        #     self._flush_queue()
 
 
 # def _serialize_batch(self, events: List[dict]) -> bytes:
