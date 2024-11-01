@@ -253,11 +253,11 @@ class SessionApi:
         except ApiServerException as e:
             return logger.error(f"Could not post events - {e}")
 
-        # Update event counts
+        # Update event counts on the session instance
         for event in events:
-            event_type = event.get("event_type")
-            if event_type in self.event_counts:
-                self.event_counts[event_type] += 1
+            event_type = event.event_type
+            if event_type in self.session.event_counts:
+                self.session.event_counts[event_type] += 1
 
         logger.debug("\n<AGENTOPS_DEBUG_OUTPUT>")
         logger.debug(f"Session request to {self.config.endpoint}/v2/create_events")
@@ -320,6 +320,7 @@ class Session(SessionStruct):
         )
         self._events = queue.Queue[Event](self.config.max_queue_size)
         self._cleanup_done = False
+        self._stop_flag = threading.Event()
 
         # Initialize locks
         self.locks = {
@@ -335,13 +336,18 @@ class Session(SessionStruct):
             "changes": threading.Condition(self.locks["session"]),
         }
 
-        self.thread = EventPublisherThread(self)
-        self.thread.start()
+        # Initialize threads
+        self.publisher_thread = EventPublisherThread(self)
+        self.observer_thread = ChangesObserverThread(self)
 
-        self._is_running = False  # Protected state variable
+        self._is_running = False
         self.is_running = self._start_session()
 
-        if not self.is_running:
+        if self.is_running:
+            # Only start threads if session started successfully
+            self.publisher_thread.start()
+            self.observer_thread.start()
+        else:
             self.stop()
 
     @property
@@ -427,7 +433,7 @@ class Session(SessionStruct):
 
     def end_session(
         self,
-        end_state: str = "Indeterminate",
+        end_state: str = "Indeterminate",  # WARN: Shouldn't this be an EventState enum?
         end_state_reason: Optional[str] = None,
         video: Optional[str] = None,
     ) -> Union[Decimal, None]:
@@ -442,8 +448,7 @@ class Session(SessionStruct):
         self.end_state = end_state or self.end_state
         self.end_state_reason = end_state_reason or self.end_state_reason
 
-        # TODO: Privatize modifier by nomenclature
-        def __duration():
+        def __calc_elapsed():
             start = dt.datetime.fromisoformat(
                 self.init_timestamp.replace("Z", "+00:00")
             )
@@ -476,7 +481,7 @@ class Session(SessionStruct):
         logger.debug(res.body)
         token_cost = res.body.get("token_cost", "unknown")
 
-        formatted_duration = __duration()
+        formatted_duration = __calc_elapsed()
 
         if token_cost == "unknown" or token_cost is None:
             token_cost_d = Decimal(0)
@@ -564,17 +569,26 @@ class Session(SessionStruct):
                 return
 
             self._is_running = False
+            self._stop_flag.set()  # Signal threads to stop
 
             # Flush any remaining events
             with self.locks["events"]:
                 if not self._events.empty():
                     self._flush_queue()
 
-            # Signal the publisher thread to stop
-            self.thread.stop()
+            # Stop both threads with timeout
+            timeout = self.config.graceful_shutdown_wait_time / 1000
+            threads = [self.publisher_thread, self.observer_thread]
 
-            # Wait for thread cleanup with timeout from config
-            self.thread.join(timeout=self.config.graceful_shutdown_wait_time / 1000)
+            for thread in threads:
+                if thread.is_alive():
+                    thread.stop()
+                    thread.join(timeout=timeout / 2)  # Split timeout between threads
+
+                    if thread.is_alive():
+                        logger.warning(
+                            f"{thread.__class__.__name__} failed to stop gracefully"
+                        )
 
             # Ensure session is properly ended
             if not self.end_timestamp:
@@ -590,6 +604,24 @@ class Session(SessionStruct):
                 self._cleanup_done = True
                 self.conditions["cleanup"].notify_all()
 
+    def pause(self) -> None:
+        """
+        Temporarily pause event processing without stopping the session.
+        """
+        with self.locks["lifecycle"]:
+            if not self._is_running:
+                return
+            self._stop_flag.set()
+
+    def resume(self) -> None:
+        """
+        Resume a paused session.
+        """
+        with self.locks["lifecycle"]:
+            if not self._is_running:
+                return
+            self._stop_flag.clear()
+
     def _cleanup(self) -> None:
         """
         Internal cleanup method that ensures proper session termination.
@@ -602,9 +634,21 @@ class Session(SessionStruct):
             self.stop()
 
             # Wait for cleanup to complete with configured timeout
-            self.conditions["cleanup"].wait(
+            cleanup_success = self.conditions["cleanup"].wait(
                 timeout=self.config.graceful_shutdown_wait_time / 1000
             )
+
+            if not cleanup_success:
+                logger.error("Session cleanup timed out")
+
+    def __enter__(self):
+        """Support for context manager protocol"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure cleanup on context exit"""
+        self.stop()
+        return False  # Don't suppress exceptions
 
     def __del__(self):
         """Ensure cleanup runs when object is garbage collected"""
@@ -637,50 +681,41 @@ class _SessionThread(threading.Thread):
         super().__init__()
         self.s = session
         self.daemon = True
-        self.l_stop = threading.Lock()
+        self._local_stop = threading.Event()
 
     @property
     def stopping(self) -> bool:
-        return self.l_stop.locked()
+        return self._local_stop.is_set() or self.s._stop_flag.is_set()
 
     @property
     def running(self) -> bool:
         return not self.stopping
 
     def stop(self) -> None:
-        with self.stopping:
-            with self.s.runtime_condition:
-                if not self.s._events:
-                    self.s.runtime_condition.wait(
-                        timeout=self.s.config.max_wait_time / 1000
-                    )
-                if self.s._events:
-                    self.s._flush_queue()
+        """Signal thread to stop"""
+        self._local_stop.set()
 
 
 class ChangesObserverThread(_SessionThread):
     """Observes changes in the session and performs API calls for event publishing."""
 
     def run(self) -> None:
-        """
-        Waits for a condition and performs API calls to publish events.
-        """
-        while self.running:
-            with (condition := self.s.conditions["changes"]):
-                condition.wait()  # Wait for a notification from _publish
+        while not self.stopping:
+            try:
+                with self.s.conditions["changes"]:
+                    # Wait with timeout to check stop flag periodically
+                    self.s.conditions["changes"].wait(timeout=0.5)
 
-                self._perform_api_call()  # Perform the API call to publish events using SessionApi
+                    if self.stopping:
+                        break
 
-    def _perform_api_call(self) -> None:
-        """
-        Performs the API call using SessionApi.
-        """
-        try:
-            # Example API call
-            self.session.api.update_session()
-            logger.info("Session updated successfully.")
-        except ApiServerException as e:
-            logger.error(f"Could not update session - {e}")
+                    if self.s._events:
+                        self._perform_api_call()
+            except Exception as e:
+                logger.error(f"Error in observer thread: {e}")
+                if self.stopping:
+                    break
+                time.sleep(1)  # Back off on errors
 
 
 class EventPublisherThread(_SessionThread):
@@ -787,3 +822,20 @@ class EventPublisherThread(_SessionThread):
 active_sessions: List[Session] = []
 
 __all__ = ["Session"]
+
+
+if __name__ == "__main__":
+    # Using as context manager (recommended)
+    with Session(uuid4(), config=Configuration()) as session:
+        # Use session...
+        pass  # Cleanup happens automatically
+
+    # Manual management
+    session = Session(uuid4(), config=Configuration())
+    try:
+        # Use session...
+        session.pause()  # Temporarily pause processing
+        # Do something...
+        session.resume()  # Resume processing
+    finally:
+        session.stop()  # Explicit cleanup
