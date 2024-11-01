@@ -58,6 +58,7 @@ Major changes:
 """
 
 
+
 @dataclass
 class EventsCounter:
     llms: int = 0
@@ -66,6 +67,37 @@ class EventsCounter:
     errors: int = 0
     apis: int = 0
 
+
+
+# TODO: Ideally, we can have a custom list with counters builtin
+# class EventCounterList(list):
+#     def __init__(self, *args):
+#         super().__init__(*args)
+#         self.counters = {event.name: 0 for event in EventType}
+
+
+class Counter(object):
+    """
+    Thread safe Counter
+    """
+    # TODO: Move to a separate, utilities module
+
+    def __init__(self, value=0, mutex=None):
+        # RawValue because we don't need it to create a Lock:
+        self.val = value
+        self.mutex = mutex or threading.Lock()
+
+    def increment(self):
+        with self.mutex:
+            self.val += 1
+
+    def decrement(self):
+        with self.mutex:
+            self.val -= 1
+
+    def value(self):
+        with self.mutex:
+            return self.val
 
 @dataclass
 class SessionStruct:
@@ -199,7 +231,7 @@ class SessionApi:
 
             return True
 
-    def batch(self, events: Iterable[Event]) -> None:
+    def batch(self, events: List[Event]) -> None:
         serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
         try:
             HttpClient.post(
@@ -280,6 +312,10 @@ class Session(SessionStruct):
         for k in {"lifecycle", "events", "session", "tags"}:
             self.locks[k] = threading.Lock()
 
+        self.conditions = {
+            "cleanup": threading.Condition(self.locks['lifecycle']) # Share the same lifecycle lock
+        }
+
         self.thread = EventPublisherThread(self)
         self.thread.start()
 
@@ -318,7 +354,7 @@ class Session(SessionStruct):
                 if tag not in self.tags:
                     self.tags.append(tag)
 
-        self._notify()
+        self._publish()
 
     def set_tags(self, tags):
         if not self.is_running:
@@ -329,7 +365,8 @@ class Session(SessionStruct):
                 tags = [tags]
 
         self.tags = tags
-        self._notify()
+        self._publish()
+
 
     # --- Interactors
     def record(self, event: Union[Event, ErrorEvent]):
@@ -450,7 +487,7 @@ class Session(SessionStruct):
 
         return token_cost_d
 
-    def create_agent(self, name: str, agent_id: Optional[str] = None) -> None:
+    def create_agent(self, name: str, agent_id: Optional[str] = None) -> object: # FIXME: Is this `int`, `UUID`, or `str`?
         if not self.is_running:
             return
         if agent_id is None:
@@ -481,19 +518,17 @@ class Session(SessionStruct):
             self._flush_queue()
         self.condition.notify()
 
+
+    def _publish(self):
+        """Notify the ChangesObserverThread to publish the events"""
+
     @property
     def is_running(self):
-        # Use the runtime condition to determine wheter we're running
-        try:
-            # If we can acquire it, then the session is NOT running
-            return not self.runtime_condition.acquire(blocking=False)
-        finally:
-            # Release it immediately
-            self.runtime_condition.release()
+        pass
+
 
     def stop(self):
-        with self.locks["lifecycle"]:
-            pass
+        pass
 
     def pause(self):  # Concept
         raise NotImplementedError
@@ -507,7 +542,10 @@ class Session(SessionStruct):
         """
         # :: Try to acquire the runtime lock, but don't Block if it is not free
         # :: There is no reason to block because there's no reason to stack such events
-        if not self.runtime_condition.acquire(blocking=False):
+
+        to_be_decided = object
+        
+        if not self.locks.acquire(blocking=False):
             # We can't perform a cleanup if there's no runtime
             # return self.thread.join()
             pass
@@ -515,12 +553,7 @@ class Session(SessionStruct):
             # if not self.
             # if self.is_running and not self.end_timestamp: # Why do we need to check for the end_timestamp though?
             # self.stop_flag.set() # FIXME: Does it need to show running?
-            # self.thread.join(timeout=0.1)
-
-            self.thread
-
             self.dispatch()
-
             try:
                 self.terminate(
                     end_state="Indeterminate",
@@ -539,13 +572,12 @@ class Session(SessionStruct):
 
 
 
-
-
 class ChangesObserverThread(threading.Thread):
     pass
+    
 
 class EventPublisherThread(threading.Thread):
-    """Polls events from Session and publishes to API"""
+    """Polls events from Session, publishes API batches"""
 
     def __init__(self, session: Session):
         self.s = session
