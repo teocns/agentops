@@ -15,6 +15,7 @@ class Configuration:
     endpoint: str = "https://api.agentops.ai"
     max_wait_time: int = 5000
     max_queue_size: int = 512
+    graceful_shutdown_wait_time: int = 2000
     default_tags: Set[str] = field(default_factory=set)
     instrument_llm_calls: bool = True
     auto_start_session: bool = True
