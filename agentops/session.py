@@ -8,6 +8,7 @@ import json
 import queue
 import threading
 import time
+from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
@@ -19,12 +20,43 @@ from warnings import deprecated
 from termcolor import colored
 
 from .config import Configuration
-from .enums import EndState
+from .enums import EndState, EventType
 from .event import ErrorEvent, Event
 from .exceptions import ApiServerException
 from .helpers import filter_unjsonable, get_ISO_time, safe_serialize
 from .http_client import HttpClient
 from .log_config import logger
+
+"""
+Summary
+
+1. **Imports and Dependencies**: The code imports various modules and packages, including threading, JSON handling, and HTTP client utilities. It also imports custom modules like `Configuration`, `EndState`, `ErrorEvent`, `Event`, and others.
+
+2. **Data Classes**:
+   - `EventsCounter`: A simple data class to keep track of different types of events.
+   - `SessionStruct`: A data class that holds the structure of a session, including attributes like `session_id`, `config`, `end_state`, `event_counts`, and more.
+
+3. **Protocols and Mixins**:
+   - `_SessionProto`: A protocol defining the expected methods and attributes for a session, such as `asdict` and `is_running`.
+   - `SessionApiMixin`: A mixin class providing methods to interact with the session API, including updating sessions, reauthorizing JWTs, starting sessions, and dispatching events.
+
+4. **Session Class**:
+   - Inherits from `SessionStruct` and `SessionApiMixin`.
+   - Manages the lifecycle of a session, including starting, ending, and recording events.
+   - Provides methods to set video URLs, add or set tags, and handle session cleanup.
+   - Utilizes threading to manage event dispatching in the background.
+
+5. **Event Dispatcher**:
+   - `EventDisptcherThread`: A threading class responsible for publishing events to the API in the background.
+
+6. **Utility Functions**:
+   - `_serialize_batch`: A function to efficiently serialize a batch of events for transmission.
+
+7. **Global Variables**:
+   - `active_sessions`: A list to keep track of active session instances.
+"""
+
+
 
 
 @dataclass
@@ -41,10 +73,11 @@ class SessionStruct:
     session_id: UUID
     # --------------
     config: Configuration
-    end_state: Literal["Success", "Fail", "Indeterminate"] = "Indeterminate" # TODO: Any other states, or is strict?
+    end_state: str = EndState.INDETERMINATE.value
     end_state_reason: Optional[str] = None
     end_timestamp: Optional[str] = None
-    event_counts: dict = field(default_factory=lambda: defaultdict(int)) # Sets them to 0 by default
+    # Create a counter dictionary with each EventType name initialized to 0
+    event_counts: Dict[str, int] = field(default_factory=lambda: {event.name: 0 for event in EventType}) # Sets them to 0 by default
     host_env: Optional[dict] = None
     init_timestamp: str = field(default_factory=get_ISO_time)
     is_running: bool = False
@@ -52,41 +85,143 @@ class SessionStruct:
     tags: Optional[List[str]] = None
     video: Optional[str] = None
 
-
-
-
-# @dataclasses.dataclass
-# class DataclassProtocol(Protocol):
-#     # as already noted in comments, checking for this attribute is currently
-#     # the most reliable way to ascertain that something is a dataclass
-#     __dataclass_fields__: ClassVar[Dict[str, Any]] 
-
-
-# class _AsDictProvider(Protocol):
-#     def asdict(self) -> Dict[str, Any]:
-#         ...
-
-class SessionApiMixin(Protocol):
+@runtime_checkable
+class _SessionProto(Protocol):
+    """Protocol for internal Session attributes that shouldn't be part of the dataclass"""
+    locks: Dict[Literal['lifecycle', 'events', 'session', 'tags'], threading.Lock]
     config: Configuration
-    def _update_session(self) -> None:
-        # TODO: Should this rather assert that the session is running?
-        # This is true if we don't expect `_update_session` to be invoked if the session
-        # isn't running either
-        # if not self.is_running:
-        #     return
-        # with self.lock:
-        # with self.locks['payload']
+    session_id: UUID
 
+    def asdict(self) -> Dict[str, Any]:
+        ...
+    def is_running(self) -> bool:
+        ...
+
+
+        
+
+class SessionApiMixin(_SessionProto):
+    """Focuses exclusively on interacting with the API"""
+
+    # FIXME: Need to clarify or define a standardized Api interface. Priorily, these 
+    # methods used to perform something like `return logger.error(exc)` within 
+    # the catch blocks`, which wasn't intuitive enough to define expectancies
+
+    def _update_session(self) -> None:
         try:
+            payload = {"session": self.asdict()}
             res = HttpClient.post(
                 f"{self.config.endpoint}/v2/update_session",
-                json.dumps(filter_unjsonable({"session": self.asdict()})).encode("utf-8"),
+                json.dumps(filter_unjsonable(payload)).encode("utf-8"),
                 jwt=self.jwt,
             )
         except ApiServerException as e:
             return logger.error(f"Could not update session - {e}")
 
-class Session(SessionStruct):
+    def _reauthorize_jwt(self) -> Union[str, None]:
+        payload = {"session_id": self.session_id}
+        serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
+        res = HttpClient.post(
+            f"{self.config.endpoint}/v2/reauthorize_jwt",
+            serialized_payload,
+            self.config.api_key,
+        )
+
+        logger.debug(res.body)
+
+        if res.code != 200:
+            return None
+
+        jwt = res.body.get("jwt", None)
+        self.jwt = jwt
+        return jwt
+
+    def _start_session(self) -> bool:
+        with self.locks['lifecycle']:
+            payload = {"session": self.__dict__}
+            serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
+
+            try:
+                res = HttpClient.post(
+                    f"{self.config.endpoint}/v2/create_session",
+                    serialized_payload,
+                    self.config.api_key,
+                    self.config.parent_key,
+                )
+            except ApiServerException as e:
+                logger.error(f"Could not start session - {e}")
+                return False
+
+            logger.debug(res.body)
+
+            if res.code != 200:
+                return False
+
+            jwt = res.body.get("jwt", None)
+            self.jwt = jwt
+            if jwt is None:
+                return False
+
+            session_url = res.body.get(
+                "session_url",
+                f"https://app.agentops.ai/drilldown?session_id={self.session_id}",
+            )
+
+            logger.info(
+                colored(
+                    f"\x1b[34mSession Replay: {session_url}\x1b[0m",
+                    "blue",
+                )
+            )
+
+            return True
+
+    def dispatch(self, session: SessionStruct, events: List[dict]) -> None:
+        serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
+        try:
+            HttpClient.post(
+                f"{self.config.endpoint}/v2/create_events",
+                serialized_payload,
+                jwt=self.jwt,
+            )
+        except ApiServerException as e:
+            return logger.error(f"Could not post events - {e}")
+
+        # Update event counts
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type in self.event_counts:
+                self.event_counts[event_type] += 1
+
+        logger.debug("\n<AGENTOPS_DEBUG_OUTPUT>")
+        logger.debug(f"Session request to {self.config.endpoint}/v2/create_events")
+        logger.debug(serialized_payload)
+        logger.debug("</AGENTOPS_DEBUG_OUTPUT>\n")
+
+    def create_agent(self, name: str, agent_id: Optional[str] = None) -> None:
+        if not self.is_running:
+            return
+        if agent_id is None:
+            agent_id = str(uuid4())
+
+        payload = {
+            "id": agent_id,
+            "name": name,
+        }
+
+        serialized_payload = safe_serialize(payload).encode("utf-8")
+        try:
+            HttpClient.post(
+                f"{self.config.endpoint}/v2/create_agent",
+                serialized_payload,
+                jwt=self.jwt,
+            )
+        except ApiServerException as e:
+            logger.error(f"Could not create agent - {e}")
+
+        return agent_id
+
+class Session(SessionStruct, SessionApiMixin):
     """
     Represents a session of events, with a start and end state.
 
@@ -177,21 +312,6 @@ class Session(SessionStruct):
             return logger.warning(
                 "Invalid end_state. Please use one of the EndState enums"
             )
-
-        # if self._terminate:
-        #     raise RuntimeError("Cannot end a terminated session")
-        #
-        # with self.runtime_condition:  # This needs to lock because we don't expect end_session to end multiple times 
-        #     if not self.is_running or self.end_timestamp:
-        #         return
-        #
-        #     self.end_state_reason = end_state_reason
-        #     if video is not None:
-        #         self.video = video
-        #
-        # self.stop_flag.set()
-        # self.thread.join(timeout=1)
-        # self._flush_queue()
 
         self.end_state = end_state or self.end_state
         self.end_state_reason = end_state_reason or self.end_state_reason
@@ -334,165 +454,6 @@ class Session(SessionStruct):
             self._flush_queue()
         self.condition.notify()
 
-    def _reauthorize_jwt(self) -> Union[str, None]:
-        with self.lock:
-            payload = {"session_id": self.session_id}
-            serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
-            res = HttpClient.post(
-                f"{self.config.endpoint}/v2/reauthorize_jwt",
-                serialized_payload,
-                self.config.api_key,
-            )
-
-            logger.debug(res.body)
-
-            if res.code != 200:
-                return None
-
-            jwt = res.body.get("jwt", None)
-            self.jwt = jwt
-            return jwt
-
-
-    @property
-    def queue(self) -> queue.Queue:
-        return self._queue.queue
-        # if not self.is_running:
-            # return
-        # self._events.put(event)
-
-    def _start_session(self):
-        with self.lock['lifecycle']:
-            """
-            `lifecycle_lock` be acquired in two scenarios: starting and ending the session
-            """
-            self._queue = queue.Queue()
-            payload = {"session": self.__dict__}
-            serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
-
-            try:
-                res = HttpClient.post(
-                    f"{self.config.endpoint}/v2/create_session",
-                    serialized_payload,
-                    self.config.api_key,
-                    self.config.parent_key,
-                )
-            except ApiServerException as e:
-                return logger.error(f"Could not start session - {e}")
-
-            logger.debug(res.body)
-
-            if res.code != 200:
-                return False
-
-            jwt = res.body.get("jwt", None)
-            self.jwt = jwt
-            if jwt is None:
-                return False
-
-            session_url = res.body.get(
-                "session_url",
-                f"https://app.agentops.ai/drilldown?session_id={self.session_id}",
-            )
-
-            logger.info(
-                colored(
-                    f"\x1b[34mSession Replay: {session_url}\x1b[0m",
-                    "blue",
-                )
-            )
-
-            return True
-
-
-
-
-    def batch(
-            self, 
-            __batch_size: Annotated[Optional[int], "Maximum batch size"] = None,
-            /,
-            wait: Annotated[bool, "Will block if the queue is empty, only use if infinity is your limits"] = False,
-            timeout=None
-        ) -> Generator[Event, None, int]:
-        MAX_BATCH_SIZE =  max(__batch_size, self.config.max_queue_size) if __batch_size else self.config.max_queue_size
-        # safety measure to avoid a presumable infinite process
-        # whereas the queue keeps growing indefinitely 
-        # (hence why docstrings try to warn you about 'queue' computed qsize/empty methods )
-        q_size = self._events.qsize()
-        buf = 0
-        while (
-            buf < MAX_BATCH_SIZE # Don't exceed configured max batch size
-        ) and (
-            buf < q_size # Don't exceed the queue size
-        ):
-            yield self._events.get(block=wait) 
-            buf+=1
-
-        return q_size - buf # Return remaining items
-
-
-    def dispatch(self, events: List[dict]) -> None:
-        """
-        Dispatches a batch of events to the API using buffered serialization
-        
-        Args:
-            events (List[dict]): List of events to dispatch
-        """
-
-        # INFO: Consider whether the below might be good replacements for `safe_serialize`
-        # - https://github.com/aviramha/ormsgpack | For fast a.f serialization w/ msgpack + orjson
-        # - https://docs.pydantic.dev/latest/api/pydantic_core/#pydantic_core.to_jsonable_python | for a builtin pydantic encoder
-        serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
-        try:
-            HttpClient.post(
-                f"{self.config.endpoint}/v2/create_events",
-                serialized_payload,
-                jwt=self.jwt,
-            )
-        except ApiServerException as e:
-            return logger.error(f"Could not post events - {e}")
-
-        # Update event counts
-        for event in events:
-            event_type = event.get("event_type")
-            if event_type in self.event_counts:
-                self.event_counts[event_type] += 1
-
-        logger.debug("\n<AGENTOPS_DEBUG_OUTPUT>")
-        logger.debug(f"Session request to {self.config.endpoint}/v2/create_events")
-        logger.debug(serialized_payload)
-        logger.debug("</AGENTOPS_DEBUG_OUTPUT>\n")
-
-    def create_agent(self, name, agent_id):
-        if not self.is_running:
-            return
-        if agent_id is None:
-            agent_id = str(uuid4())
-
-        payload = {
-            "id": agent_id,
-            "name": name,
-        }
-
-        serialized_payload = safe_serialize(payload).encode("utf-8")
-        try:
-            HttpClient.post(
-                f"{self.config.endpoint}/v2/create_agent",
-                serialized_payload,
-                jwt=self.jwt,
-            )
-        except ApiServerException as e:
-            return logger.error(f"Could not create agent - {e}")
-
-        return agent_id
-
-    def patch(self, func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            kwargs["session"] = self
-            return func(*args, **kwargs)
-
-        return wrapper
 
     @property
     def is_running(self):

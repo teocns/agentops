@@ -4,6 +4,9 @@ from uuid import UUID
 
 from .log_config import logger
 
+# TODO: Use annotations to clarify the purpose of each attribute. 
+# Details are defined in a docstrings found in __init__.py, but 
+# it's good to have those right on the fields at class definition 
 
 @dataclass
 class Configuration:
