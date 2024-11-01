@@ -6,17 +6,8 @@ import queue
 import threading
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from typing import (
-    Annotated,
-    Any,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Protocol,
-    Union,
-    runtime_checkable,
-)
+from typing import (Annotated, Any, Dict, Iterable, List, Literal, Optional,
+                    Protocol, Union, runtime_checkable)
 from uuid import UUID, uuid4
 
 from termcolor import colored
@@ -114,27 +105,27 @@ class SessionApi:
     Solely focuses on interacting with the API
 
     Developer notes:
-        Need to clarify (and define) a standardized and consistent Api interface.
-        Session as a conceptual entity also wants to hold the HttpClient session to
-        ensure a standardized, consistent and predictable behavior
+        Need to clarify (and define) a standard and consistent Api interface.
 
         The way it can be approached is by having a base `Api` class that holds common
-        configuration, while implementors provide entity-related controllers.
+        configurations and features, while implementors provide entity-related controllers
     """
 
     # TODO: Decouple from standard Configuration a Session's entity own configuration.
     # NOTE: pydantic-settings plays out beautifully in such setup, but it's not a requirement.
-    config: Configuration
-
+    # TODO: Eventually move to apis/
     session: Session
 
-    def __init__(self, session: Session, config: Configuration):
-        self.config = config
+    def __init__(self, session: Session):
         self.session = session
 
-    def update_session(self, session: SessionStruct) -> None:
+    @property
+    def config(self):  # Forward decl.
+        return self.session.config
+
+    def update_session(self) -> None:
         try:
-            payload = {"session": asdict(session)}
+            payload = {"session": asdict(self.session)}
             res = HttpClient.post(
                 f"{self.config.endpoint}/v2/update_session",
                 json.dumps(filter_unjsonable(payload)).encode("utf-8"),
@@ -143,9 +134,9 @@ class SessionApi:
         except ApiServerException as e:
             return logger.error(f"Could not update session - {e}")
 
-    # WARN: This method seems deprecated, it is not being used anywhere?
-    def reauthorize_jwt(self, session: Session) -> Union[str, None]:
-        payload = {"session_id": session.session_id}
+    # WARN: Unused method
+    def reauthorize_jwt(self) -> Union[str, None]:
+        payload = {"session_id": self.session.session_id}
         serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
         res = HttpClient.post(
             f"{self.config.endpoint}/v2/reauthorize_jwt",
@@ -208,7 +199,7 @@ class SessionApi:
 
             return True
 
-    def batch(self, session: SessionStruct, events: Iterable[Event]) -> None:
+    def batch(self, events: Iterable[Event]) -> None:
         serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
         try:
             HttpClient.post(
@@ -229,29 +220,6 @@ class SessionApi:
         logger.debug(f"Session request to {self.config.endpoint}/v2/create_events")
         logger.debug(serialized_payload)
         logger.debug("</AGENTOPS_DEBUG_OUTPUT>\n")
-
-    def create_agent(self, name: str, agent_id: Optional[str] = None) -> None:
-        if not self.is_running:
-            return
-        if agent_id is None:
-            agent_id = str(uuid4())
-
-        payload = {
-            "id": agent_id,
-            "name": name,
-        }
-
-        serialized_payload = safe_serialize(payload).encode("utf-8")
-        try:
-            HttpClient.post(
-                f"{self.config.endpoint}/v2/create_agent",
-                serialized_payload,
-                jwt=self.jwt,
-            )
-        except ApiServerException as e:
-            logger.error(f"Could not create agent - {e}")
-
-        return agent_id
 
 
 class Session(SessionStruct):
@@ -286,7 +254,7 @@ class Session(SessionStruct):
     # ]
 
     thread: Annotated[
-        EventDisptcherThread,
+        EventPublisherThread,
         (
             "Publishes events to the API in a background thread."
             "TODO: an eventual async support release won't need a Thread; "
@@ -312,7 +280,7 @@ class Session(SessionStruct):
         for k in {"lifecycle", "events", "session", "tags"}:
             self.locks[k] = threading.Lock()
 
-        self.thread = EventDisptcherThread(self)
+        self.thread = EventPublisherThread(self)
         self.thread.start()
 
         self.is_running = self._start_session()
@@ -328,6 +296,66 @@ class Session(SessionStruct):
             video (str): The url of the video recording
         """
         self.video = video
+
+    def add_tags(self, tags: List[str]) -> None:
+        """
+        Append to session tags at runtime.
+
+        Args:
+            tags (List[str]): The list of tags to append.
+        """
+        if not self.is_running:
+            return
+
+        if not (isinstance(tags, list) and all(isinstance(item, str) for item in tags)):
+            if isinstance(tags, str):
+                tags = [tags]
+
+        if self.tags is None:
+            self.tags = tags
+        else:
+            for tag in tags:
+                if tag not in self.tags:
+                    self.tags.append(tag)
+
+        self._notify()
+
+    def set_tags(self, tags):
+        if not self.is_running:
+            return
+
+        if not (isinstance(tags, list) and all(isinstance(item, str) for item in tags)):
+            if isinstance(tags, str):
+                tags = [tags]
+
+        self.tags = tags
+        self._notify()
+
+    # --- Interactors
+    def record(self, event: Union[Event, ErrorEvent]):
+        if not self.is_running:
+            return
+        if isinstance(event, Event):
+            if not event.end_timestamp or event.init_timestamp == event.end_timestamp:
+                event.end_timestamp = get_ISO_time()  # WARN: Unrestricted assignment
+        elif isinstance(event, ErrorEvent):
+            if event.trigger_event:
+                if (
+                    not event.trigger_event.end_timestamp
+                    or event.trigger_event.init_timestamp
+                    == event.trigger_event.end_timestamp
+                ):
+                    event.trigger_event.end_timestamp = get_ISO_time()
+
+                event.trigger_event_id = event.trigger_event.id
+                event.trigger_event_type = event.trigger_event.event_type
+                self._enqueue(event.trigger_event.__dict__)
+                event.trigger_event = None  # removes trigger_event from serialization
+                # ^^ NOTE: Consider memento https://refactoring.guru/design-patterns/memento/python/example
+
+        self._enqueue(
+            event.__dict__
+        )  # WARNING: This is very dangerous. Either define Event.__slots__ or turn Event into a dataclass
 
     def end_session(
         self,
@@ -422,64 +450,28 @@ class Session(SessionStruct):
 
         return token_cost_d
 
-    def add_tags(self, tags: List[str]) -> None:
-        """
-        Append to session tags at runtime.
-
-        Args:
-            tags (List[str]): The list of tags to append.
-        """
+    def create_agent(self, name: str, agent_id: Optional[str] = None) -> None:
         if not self.is_running:
             return
+        if agent_id is None:
+            agent_id = str(uuid4())
 
-        if not (isinstance(tags, list) and all(isinstance(item, str) for item in tags)):
-            if isinstance(tags, str):
-                tags = [tags]
+        payload = {
+            "id": agent_id,
+            "name": name,
+        }
 
-        if self.tags is None:
-            self.tags = tags
-        else:
-            for tag in tags:
-                if tag not in self.tags:
-                    self.tags.append(tag)
+        serialized_payload = safe_serialize(payload).encode("utf-8")
+        try:
+            HttpClient.post(
+                f"{self.config.endpoint}/v2/create_agent",
+                serialized_payload,
+                jwt=self.jwt,
+            )
+        except ApiServerException as e:
+            logger.error(f"Could not create agent - {e}")
 
-        self.update_session()
-
-    def set_tags(self, tags):
-        if not self.is_running:
-            return
-
-        if not (isinstance(tags, list) and all(isinstance(item, str) for item in tags)):
-            if isinstance(tags, str):
-                tags = [tags]
-
-        self.tags = tags
-        self.update_session()
-
-    def record(self, event: Union[Event, ErrorEvent]):
-        if not self.is_running:
-            return
-        if isinstance(event, Event):
-            if not event.end_timestamp or event.init_timestamp == event.end_timestamp:
-                event.end_timestamp = get_ISO_time()  # WARN: Unrestricted assignment
-        elif isinstance(event, ErrorEvent):
-            if event.trigger_event:
-                if (
-                    not event.trigger_event.end_timestamp
-                    or event.trigger_event.init_timestamp
-                    == event.trigger_event.end_timestamp
-                ):
-                    event.trigger_event.end_timestamp = get_ISO_time()
-
-                event.trigger_event_id = event.trigger_event.id
-                event.trigger_event_type = event.trigger_event.event_type
-                self._enqueue(event.trigger_event.__dict__)
-                event.trigger_event = None  # removes trigger_event from serialization
-                # ^^ NOTE: Consider memento https://refactoring.guru/design-patterns/memento/python/example
-
-        self._enqueue(
-            event.__dict__
-        )  # WARNING: This is very dangerous. Either define Event.__slots__ or turn Event into a dataclass
+        return agent_id
 
     def _enqueue(self, event: dict) -> None:
         # with self.events_buffer.mutex:
@@ -498,6 +490,13 @@ class Session(SessionStruct):
         finally:
             # Release it immediately
             self.runtime_condition.release()
+
+    def stop(self):
+        with self.locks["lifecycle"]:
+            pass
+
+    def pause(self):  # Concept
+        raise NotImplementedError
 
     def _cleanup(self):
         """
@@ -539,7 +538,13 @@ class Session(SessionStruct):
                 self.condition.release()
 
 
-class EventDisptcherThread(threading.Thread):
+
+
+
+class ChangesObserverThread(threading.Thread):
+    pass
+
+class EventPublisherThread(threading.Thread):
     """Polls events from Session and publishes to API"""
 
     def __init__(self, session: Session):
@@ -569,14 +574,28 @@ class EventDisptcherThread(threading.Thread):
                 if self.s._events:
                     self.s._flush_queue()
 
-    def run(self) -> None:
-        while self.running:
-            with self.condition:
-                pass
-                # if not self.events_buffer:
-                #     self.condition.wait(timeout=self.config.max_wait_time / 1000)
-                # if self.events_buffer:
-                #     self._flush_queue()
+    def run(self) -> None:  # virtual override
+        """
+        `threading.Thread` invokes this on Thread.start()
+
+        Will poll for events
+        """
+
+        while True:
+            with self.poll
+                if not self.s._events:
+                    self.s.runtime_condition.wait(
+                        timeout=self.s.config.max_wait_time / 1000
+                    )
+                if self.s._events:
+                    self.s._flush_queue()
+        # while self.running:
+        #     with self.condition:
+        #         pass
+        # if not self.events_buffer:
+        #     self.condition.wait(timeout=self.config.max_wait_time / 1000)
+        # if self.events_buffer:
+        #     self._flush_queue()
 
 
 # def _serialize_batch(self, events: List[dict]) -> bytes:
