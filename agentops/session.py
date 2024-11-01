@@ -12,8 +12,20 @@ from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from typing import (Annotated, Any, ClassVar, Dict, Generator, List, Literal,
-                    Optional, Protocol, Type, Union, runtime_checkable)
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    Dict,
+    Generator,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Type,
+    Union,
+    runtime_checkable,
+)
 from uuid import UUID, uuid4
 from warnings import deprecated
 
@@ -65,8 +77,6 @@ Major changes:
 """
 
 
-
-
 @dataclass
 class EventsCounter:
     llms: int = 0
@@ -85,7 +95,9 @@ class SessionStruct:
     end_state_reason: Optional[str] = None
     end_timestamp: Optional[str] = None
     # Create a counter dictionary with each EventType name initialized to 0
-    event_counts: Dict[str, int] = field(default_factory=lambda: {event.name: 0 for event in EventType}) # Sets them to 0 by default
+    event_counts: Dict[str, int] = field(
+        default_factory=lambda: {event.name: 0 for event in EventType}
+    )  # Sets them to 0 by default
     host_env: Optional[dict] = None
     init_timestamp: str = field(default_factory=get_ISO_time)
     is_running: bool = False
@@ -93,20 +105,19 @@ class SessionStruct:
     tags: Optional[List[str]] = None
     video: Optional[str] = None
 
+
 @runtime_checkable
 class _SessionProto(Protocol):
     """Protocol for internal Session attributes that shouldn't be part of the dataclass"""
-    locks: Dict[Literal['lifecycle', 'events', 'session', 'tags'], threading.Lock]
+
+    locks: Dict[Literal["lifecycle", "events", "session", "tags"], threading.Lock]
     config: Configuration
     session_id: UUID
 
-    def asdict(self) -> Dict[str, Any]:
-        ...
-    def is_running(self) -> bool:
-        ...
+    def asdict(self) -> Dict[str, Any]: ...
 
+    def is_running(self) -> bool: ...
 
-        
 
 class SessionApi:
     """
@@ -114,18 +125,25 @@ class SessionApi:
 
     Developer notes:
         Need to clarify (and define) a standardized and consistent Api interface.
-        Session as a conceptual entity also wants to hold the HttpClient session to 
+        Session as a conceptual entity also wants to hold the HttpClient session to
         ensure a standardized, consistent and predictable behavior
 
         The way it can be approached is by having a base `Api` class that holds common
         configuration, while implementors provide entity-related controllers.
     """
-    # TODO: Decouple standard Configuration into a more exact SessionConfiguration entity.
-    # See Developer notes. 
-    # NOTE: pydantic-settings works beautifully in such setup, but it's not a requirement.
-    config: Configuration 
 
-    def update_session(self,session: SessionStruct) -> None:
+    # TODO: Decouple from standard Configuration a Session's entity own configuration.
+    # See Developer notes.
+    # NOTE: pydantic-settings works beautifully in such setup, but it's not a requirement.
+    config: Configuration
+
+    session: Session
+
+    def __init__(self, session: Session, config: Configuration):
+        self.config = config
+        self.session = session
+
+    def update_session(self, session: SessionStruct) -> None:
         try:
             payload = {"session": asdict(session)}
             res = HttpClient.post(
@@ -135,7 +153,6 @@ class SessionApi:
             )
         except ApiServerException as e:
             return logger.error(f"Could not update session - {e}")
-
 
     # WARN: This method seems deprecated, it is not being used anywhere?
     def reauthorize_jwt(self) -> Union[str, None]:
@@ -156,24 +173,30 @@ class SessionApi:
         self.jwt = jwt
         return jwt
 
-    def _start_session(self) -> bool:
-        with self.locks['lifecycle']:
-            payload = {"session": self.__dict__}
-            serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
+    def create_session(self, session: SessionStruct):
+        """
+        Creates a new session via API call
 
-            try:
-                res = HttpClient.post(
-                    f"{self.config.endpoint}/v2/create_session",
-                    serialized_payload,
-                    self.config.api_key,
-                    self.config.parent_key,
-                )
-            except ApiServerException as e:
-                logger.error(f"Could not start session - {e}")
-                return False
+        Returns:
+            tuple containing:
+            - success (bool): Whether the creation was successful
+            - jwt (Optional[str]): JWT token if successful
+            - session_url (Optional[str]): URL to view the session if successful
+        """
+        payload = {"session": asdict(session)}
+        serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
 
-            logger.debug(res.body)
-
+        try:
+            res = HttpClient.post(
+                f"{self.config.endpoint}/v2/create_session",
+                serialized_payload,
+                self.config.api_key,
+                self.config.parent_key,
+            )
+        except ApiServerException as e:
+            logger.error(f"Could not start session - {e}")
+            return False
+        else:
             if res.code != 200:
                 return False
 
@@ -184,7 +207,7 @@ class SessionApi:
 
             session_url = res.body.get(
                 "session_url",
-                f"https://app.agentops.ai/drilldown?session_id={self.session_id}",
+                f"https://app.agentops.ai/drilldown?session_id={session.session_id}",
             )
 
             logger.info(
@@ -196,8 +219,7 @@ class SessionApi:
 
             return True
 
-    def dispatch(self, session: SessionStruct, events: List[dict]) -> None:
-
+    def batch(self, session: SessionStruct, events: Iterable[Event]) -> None:
         serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
         try:
             HttpClient.post(
@@ -242,6 +264,7 @@ class SessionApi:
 
         return agent_id
 
+
 class Session(SessionStruct):
     """
     Represents a session of events, with a start and end state.
@@ -258,7 +281,6 @@ class Session(SessionStruct):
 
     """
 
-
     # If ever wanting to safely use __dict__ for serialization, uncomment the below
     # __slots__ = [
     #     "session_id",
@@ -274,13 +296,16 @@ class Session(SessionStruct):
     #     "event_counts",
     # ]
 
+    thread: Annotated[
+        EventDisptcherThread,
+        (
+            "Publishes events to the API in a background thread."
+            "TODO: an eventual async support release won't need a Thread; "
+            "instead attach to existing loop executor. Plan for support"
+        ),
+    ]
 
-    thread: Annotated[EventDisptcherThread, ("Publishes events to the API in a background thread."
-                                             "TODO: an eventual async support release won't need a Thread; "
-                                             "instead attach to existing loop executor. Plan for support")]
-
-    locks: Dict[Literal['lifecycle', 'events', 'session', 'tags'], threading.Lock]
-
+    locks: Dict[Literal["lifecycle", "events", "session", "tags"], threading.Lock]
 
     def __init__(
         self,
@@ -291,11 +316,11 @@ class Session(SessionStruct):
     ):
         self.packet = None
         self.jwt = None
-        
+
         self._events = queue.Queue[Event](self.config.max_queue_size)
-        
+
         self.locks = {}
-        for k in {'lifecycle', 'events', 'session', 'tags'}:
+        for k in {"lifecycle", "events", "session", "tags"}:
             self.locks[k] = threading.Lock()
 
         self.thread = EventDisptcherThread(self)
@@ -315,15 +340,12 @@ class Session(SessionStruct):
         """
         self.video = video
 
-
-
     def end_session(
         self,
         end_state: str = "Indeterminate",
         end_state_reason: Optional[str] = None,
         video: Optional[str] = None,
     ) -> Union[Decimal, None]:
-
         if not self.is_running:
             raise RuntimeError("Cannot end a terminated session")
 
@@ -337,7 +359,9 @@ class Session(SessionStruct):
 
         # TODO: Privatize modifier by nomenclature
         def __duration():
-            start = dt.datetime.fromisoformat(self.init_timestamp.replace("Z", "+00:00"))
+            start = dt.datetime.fromisoformat(
+                self.init_timestamp.replace("Z", "+00:00")
+            )
             end = dt.datetime.fromisoformat(end_timestamp.replace("Z", "+00:00"))
             duration = end - start
 
@@ -353,8 +377,8 @@ class Session(SessionStruct):
 
             return " ".join(parts)
 
-        with self.locks['api']:
-            payload = {"session": self.__dict__} # WARNING: This is very dangerous
+        with self.locks["api"]:
+            payload = {"session": self.__dict__}  # WARNING: This is very dangerous
             try:
                 res = HttpClient.post(
                     f"{self.config.endpoint}/v2/update_session",
@@ -448,7 +472,7 @@ class Session(SessionStruct):
             return
         if isinstance(event, Event):
             if not event.end_timestamp or event.init_timestamp == event.end_timestamp:
-                event.end_timestamp = get_ISO_time()
+                event.end_timestamp = get_ISO_time()  # WARN: Unrestricted assignment
         elif isinstance(event, ErrorEvent):
             if event.trigger_event:
                 if (
@@ -462,17 +486,19 @@ class Session(SessionStruct):
                 event.trigger_event_type = event.trigger_event.event_type
                 self._enqueue(event.trigger_event.__dict__)
                 event.trigger_event = None  # removes trigger_event from serialization
+                # ^^ NOTE: Consider memento https://refactoring.guru/design-patterns/memento/python/example
 
-        self._enqueue(event.__dict__) # WARNING: This is very dangerous
+        self._enqueue(
+            event.__dict__
+        )  # WARNING: This is very dangerous. Either define Event.__slots__ or turn Event into a dataclass
 
     def _enqueue(self, event: dict) -> None:
         # with self.events_buffer.mutex:
         self._events.queue.append(event)
-        
+
         if len(self._events) >= self.config.max_queue_size:
             self._flush_queue()
         self.condition.notify()
-
 
     @property
     def is_running(self):
@@ -523,6 +549,7 @@ class Session(SessionStruct):
             if acquired:
                 self.condition.release()
 
+
 class EventDisptcherThread(threading.Thread):
     """Thread to publish events to the API"""
 
@@ -557,44 +584,42 @@ class EventDisptcherThread(threading.Thread):
     def run(self) -> None:
         while self.running:
             with self.condition:
+                pass
                 # if not self.events_buffer:
                 #     self.condition.wait(timeout=self.config.max_wait_time / 1000)
                 # if self.events_buffer:
                 #     self._flush_queue()
 
 
-
-def _serialize_batch(self, events: List[dict]) -> bytes:
-    """
-    Efficiently serialize a batch of events.
-    
-    Args:
-        events (List[dict]): List of event dictionaries to serialize
-        
-    Returns:
-        bytes: Serialized events payload ready for transmission
-    """
-    payload = {
-        "events": events,
-        "session_id": str(self.session_id),
-        "batch_size": len(events)
-    }
-    
-    # Pre-process the events to remove unwanted fields
-    for event in events:
-        if "trigger_event" in event:
-            # Handle trigger events specially to avoid circular references
-            trigger = event["trigger_event"]
-            if trigger:
-                event["trigger_event_id"] = trigger.get("id")
-                event["trigger_event_type"] = trigger.get("event_type")
-                del event["trigger_event"]
-    
-    return safe_serialize(payload).encode("utf-8")
+# def _serialize_batch(self, events: List[dict]) -> bytes:
+#     """
+#     Efficiently serialize a batch of events.
+#
+#     Args:
+#         events (List[dict]): List of event dictionaries to serialize
+#
+#     Returns:
+#         bytes: Serialized events payload ready for transmission
+#     """
+#     payload = {
+#         "events": events,
+#         "session_id": str(self.session_id),
+#         "batch_size": len(events)
+#     }
+#
+#     # Pre-process the events to remove unwanted fields
+#     for event in events:
+#         if "trigger_event" in event:
+#             # Handle trigger events specially to avoid circular references
+#             trigger = event["trigger_event"]
+#             if trigger:
+#                 event["trigger_event_id"] = trigger.get("id")
+#                 event["trigger_event_type"] = trigger.get("event_type")
+#                 del event["trigger_event"]
+#
+#     return safe_serialize(payload).encode("utf-8")
 
 
 active_sessions: List[Session] = []
 
-__all__ = [
-    "Session"
-]
+__all__ = ["Session"]
