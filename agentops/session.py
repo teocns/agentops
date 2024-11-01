@@ -10,7 +10,7 @@ import threading
 import time
 from abc import abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import (Annotated, Any, ClassVar, Dict, Generator, List, Literal,
                     Optional, Protocol, Type, Union, runtime_checkable)
@@ -100,16 +100,28 @@ class _SessionProto(Protocol):
 
         
 
-class SessionApiMixin(_SessionProto):
-    """Focuses exclusively on interacting with the API"""
+class SessionApi:
+    """
+    Solely focuses on interacting with the API
 
-    # FIXME: Need to clarify or define a standardized Api interface. Priorily, these 
-    # methods used to perform something like `return logger.error(exc)` within 
-    # the catch blocks`, which wasn't intuitive enough to define expectancies
+    Developer notes:
+        Need to clarify (and define) a standardized and consistent Api interface
+        Session as a conceptual entity also wants to hold the HttpClient session to 
+        ensure a standardized, consistent and predictable behavior
 
-    def _update_session(self) -> None:
+
+        The way this can be approachedi s by having a base `Api` class that holds common
+        configuration, while implementors provide entity-related controllers.
+    """
+    # TODO: Decouple standard Configuration into a more exact SessionConfiguration entity.
+    # See Developer notes. 
+    # NOTE: pydantic-settings works beautifully in such setup, but it's not a requirement.
+    config: Configuration 
+
+    @classmethod
+    def update_session(cls,session: SessionStruct) -> None:
         try:
-            payload = {"session": self.asdict()}
+            payload = {"session": asdict(session)}
             res = HttpClient.post(
                 f"{self.config.endpoint}/v2/update_session",
                 json.dumps(filter_unjsonable(payload)).encode("utf-8"),
@@ -177,6 +189,7 @@ class SessionApiMixin(_SessionProto):
             return True
 
     def dispatch(self, session: SessionStruct, events: List[dict]) -> None:
+
         serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
         try:
             HttpClient.post(
@@ -221,7 +234,7 @@ class SessionApiMixin(_SessionProto):
 
         return agent_id
 
-class Session(SessionStruct, SessionApiMixin):
+class Session(SessionStruct):
     """
     Represents a session of events, with a start and end state.
 
@@ -237,8 +250,6 @@ class Session(SessionStruct, SessionApiMixin):
 
     """
 
-    def __init__(self, **kwargs):
-        pass
 
     # If ever wanting to safely use __dict__ for serialization, uncomment the below
     # __slots__ = [
@@ -411,7 +422,7 @@ class Session(SessionStruct, SessionApiMixin):
                 if tag not in self.tags:
                     self.tags.append(tag)
 
-        self._update_session()
+        self.update_session()
 
     def set_tags(self, tags):
         if not self.is_running:
@@ -422,7 +433,7 @@ class Session(SessionStruct, SessionApiMixin):
                 tags = [tags]
 
         self.tags = tags
-        self._update_session()
+        self.update_session()
 
     def record(self, event: Union[Event, ErrorEvent]):
         if not self.is_running:
