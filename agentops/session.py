@@ -314,28 +314,44 @@ class Session(SessionStruct):
         tags: Optional[List[str]] = None,
         host_env: Optional[dict] = None,
     ):
-        self.packet = None
-        self.jwt = None
-
+        super().__init__(session_id=session_id, config=config, tags=tags, host_env=host_env)
         self._events = queue.Queue[Event](self.config.max_queue_size)
-
-        self.locks = {}
-        for k in {"lifecycle", "events", "session", "tags"}:
-            self.locks[k] = threading.Lock()
-
+        self._cleanup_done = False
+        
+        # Initialize locks
+        self.locks = {
+            "lifecycle": threading.Lock(),  # Controls session lifecycle operations
+            "events": threading.Lock(),     # Protects event queue operations
+            "session": threading.Lock(),    # Protects session state updates
+            "tags": threading.Lock(),       # Protects tag modifications
+        }
+        
+        # Initialize conditions
         self.conditions = {
-            "cleanup": threading.Condition(
-                self.locks["lifecycle"]
-            )  # Share the same lifecycle lock
+            "cleanup": threading.Condition(self.locks["lifecycle"]),
+            "changes": threading.Condition(self.locks["session"]),
         }
 
         self.thread = EventPublisherThread(self)
         self.thread.start()
 
+        self._is_running = False  # Protected state variable
         self.is_running = self._start_session()
-        if self.is_running == False:
-            self.stop_flag.set()
-            self.thread.join(timeout=1)
+        
+        if not self.is_running:
+            self.stop()
+
+    @property 
+    def is_running(self) -> bool:
+        """Thread-safe access to running state"""
+        with self.locks["lifecycle"]:
+            return self._is_running
+
+    @is_running.setter 
+    def is_running(self, value: bool):
+        """Thread-safe modification of running state"""
+        with self.locks["lifecycle"]:
+            self._is_running = value
 
     def set_video(self, video: str) -> None:
         """
@@ -535,56 +551,80 @@ class Session(SessionStruct):
         """Notify the ChangesObserverThread to perform the API call."""
         self.conditions["changes"].notify()
 
-    @property
-    def is_running(self):
-        pass
+    def stop(self) -> None:
+        """
+        Stops the session and initiates cleanup.
+        Thread-safe and idempotent.
+        """
+        with self.locks["lifecycle"]:
+            if not self._is_running:
+                return
+            
+            self._is_running = False
+            
+            # Flush any remaining events
+            with self.locks["events"]:
+                if not self._events.empty():
+                    self._flush_queue()
+            
+            # Signal the publisher thread to stop
+            self.thread.stop()
+            
+            # Wait for thread cleanup with timeout from config
+            self.thread.join(timeout=self.config.graceful_shutdown_wait_time / 1000)
+            
+            # Ensure session is properly ended
+            if not self.end_timestamp:
+                try:
+                    self.end_session(
+                        end_state="Indeterminate",
+                        end_state_reason="Session terminated during cleanup",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to end session during cleanup: {e}")
+            
+            with self.conditions["cleanup"]:
+                self._cleanup_done = True
+                self.conditions["cleanup"].notify_all()
 
-    def stop(self):
-        pass
-
-    def pause(self):  # Concept
-        raise NotImplementedError
+    def _cleanup(self) -> None:
+        """
+        Internal cleanup method that ensures proper session termination.
+        Can be called multiple times safely.
+        """
+        with self.conditions["cleanup"]:
+            if self._cleanup_done:
+                return
+            
+            self.stop()
+            
+            # Wait for cleanup to complete with configured timeout
+            self.conditions["cleanup"].wait(
+                timeout=self.config.graceful_shutdown_wait_time / 1000
+            )
 
     def __del__(self):
-        # Whenever the Session goes out of scope, invoke cleanup
-        # (It is guaranteed to be called at the end of the runtime)
-        self.stop()
+        """Ensure cleanup runs when object is garbage collected"""
+        try:
+            self._cleanup()
+        except Exception as e:
+            logger.error(f"Error during session cleanup: {e}")
 
-    # def _cleanup(self):
-    #     """
-    #     Ensure the cleanup of the session.
-    #
-    #     This method can run once per runtime to ensure that the session is properly cleaned up.
-    #     Once the cleanup_event has occurred, it can be assumed that the session is no longer running.
-    #     """
-    #     # :: Try to acquire the runtime lock, but don't Block if it is not free
-    #     # :: There is no reason to block because there's no reason to stack such events
-    #
-    #     to_be_decided = object
-    #
-    #     if not self.locks.acquire(blocking=False):
-    #         # We can't perform a cleanup if there's no runtime
-    #         # return self.thread.join()
-    #         pass
-    #     try:
-    #         # if not self.
-    #         # if self.is_running and not self.end_timestamp: # Why do we need to check for the end_timestamp though?
-    #         # self.stop_flag.set() # FIXME: Does it need to show running?
-    #         self.dispatch()
-    #         try:
-    #             self.terminate(
-    #                 end_state="Indeterminate",
-    #                 end_state_reason="Session interrupted",
-    #             )
-    #         except:
-    #             pass
-    #
-    #         self.cleanup_condition.notify()
-    #         # self._cleanup_done = True
-    #         # self.is_running = False
-    #     finally:
-    #         if acquired:
-    #             self.condition.release()
+    def _flush_queue(self) -> None:
+        """Thread-safe queue flushing"""
+        with self.locks["events"]:
+            events = []
+            while not self._events.empty():
+                try:
+                    events.append(self._events.get_nowait())
+                except queue.Empty:
+                    break
+            
+            if events:
+                try:
+                    self.batch(events)
+                except Exception as e:
+                    logger.error(f"Failed to batch events during flush: {e}")
 
 
 class _SessionThread(threading.Thread):
