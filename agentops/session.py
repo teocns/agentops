@@ -1,33 +1,23 @@
 from __future__ import annotations  # Allow forward references
 
-import atexit
-import copy
 import datetime as dt
-import functools
 import json
 import queue
 import threading
-import time
-from abc import abstractmethod
-from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import (
     Annotated,
     Any,
-    ClassVar,
     Dict,
-    Generator,
     List,
     Literal,
     Optional,
     Protocol,
-    Type,
     Union,
     runtime_checkable,
 )
 from uuid import UUID, uuid4
-from warnings import deprecated
 
 from termcolor import colored
 
@@ -133,8 +123,7 @@ class SessionApi:
     """
 
     # TODO: Decouple from standard Configuration a Session's entity own configuration.
-    # See Developer notes.
-    # NOTE: pydantic-settings works beautifully in such setup, but it's not a requirement.
+    # NOTE: pydantic-settings plays out beautifully in such setup, but it's not a requirement.
     config: Configuration
 
     session: Session
@@ -155,8 +144,8 @@ class SessionApi:
             return logger.error(f"Could not update session - {e}")
 
     # WARN: This method seems deprecated, it is not being used anywhere?
-    def reauthorize_jwt(self) -> Union[str, None]:
-        payload = {"session_id": self.session_id}
+    def reauthorize_jwt(self, session: Session) -> Union[str, None]:
+        payload = {"session_id": session.session_id}
         serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
         res = HttpClient.post(
             f"{self.config.endpoint}/v2/reauthorize_jwt",
@@ -551,12 +540,11 @@ class Session(SessionStruct):
 
 
 class EventDisptcherThread(threading.Thread):
-    """Thread to publish events to the API"""
+    """Polls events from Session and publishes to API"""
 
     def __init__(self, session: Session):
         self.s = session
         self.daemon = True
-        # self.empty_condition = threading.Condition()  # Notiies when the queue is empty
         self.stop_requested = threading.Lock()
 
     @property
