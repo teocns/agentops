@@ -530,7 +530,6 @@ class Session(SessionStruct):
 
         if len(self._events) >= self.config.max_queue_size:
             self._flush_queue()
-        self.condition.notify()
 
     def _publish(self):
         """Notify the ChangesObserverThread to perform the API call."""
@@ -545,6 +544,11 @@ class Session(SessionStruct):
 
     def pause(self):  # Concept
         raise NotImplementedError
+
+    def __del__(self):
+        # Whenever the Session goes out of scope, invoke cleanup
+        # (It is guaranteed to be called at the end of the runtime)
+        self.stop()
 
     # def _cleanup(self):
     #     """
@@ -576,7 +580,6 @@ class Session(SessionStruct):
     #             pass
     #
     #         self.cleanup_condition.notify()
-    #
     #         # self._cleanup_done = True
     #         # self.is_running = False
     #     finally:
@@ -591,18 +594,18 @@ class _SessionThread(threading.Thread):
         super().__init__()
         self.s = session
         self.daemon = True
-        self.stop_requested = threading.Lock()
+        self.l_stop = threading.Lock()
 
     @property
     def stopping(self) -> bool:
-        return self.stop_requested.locked()
+        return self.l_stop.locked()
 
     @property
     def running(self) -> bool:
         return not self.stopping
 
     def stop(self) -> None:
-        with self.s.locks["lifecycle"]:
+        with self.stopping:
             with self.s.runtime_condition:
                 if not self.s._events:
                     self.s.runtime_condition.wait(
