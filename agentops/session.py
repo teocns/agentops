@@ -37,7 +37,7 @@ class EventsCounter:
 
 
 @dataclass
-class SessionPayload:
+class SessionStruct:
     session_id: UUID
     # --------------
     config: Configuration
@@ -62,11 +62,12 @@ class SessionPayload:
 #     __dataclass_fields__: ClassVar[Dict[str, Any]] 
 
 
-class _AsDictProvider(Protocol):
-    def asdict(self) -> Dict[str, Any]:
-        ...
+# class _AsDictProvider(Protocol):
+#     def asdict(self) -> Dict[str, Any]:
+#         ...
 
-class SessionApiMixin(_AsDictProvider):
+class SessionApiMixin(Protocol):
+    config: Configuration
     def _update_session(self) -> None:
         # TODO: Should this rather assert that the session is running?
         # This is true if we don't expect `_update_session` to be invoked if the session
@@ -75,17 +76,17 @@ class SessionApiMixin(_AsDictProvider):
         #     return
         # with self.lock:
         # with self.locks['payload']
-        payload = {"session": self.asdict()} # WARNING: This is very dangerous
+
         try:
             res = HttpClient.post(
                 f"{self.config.endpoint}/v2/update_session",
-                json.dumps(filter_unjsonable(payload)).encode("utf-8"),
+                json.dumps(filter_unjsonable({"session": self.asdict()})).encode("utf-8"),
                 jwt=self.jwt,
             )
         except ApiServerException as e:
             return logger.error(f"Could not update session - {e}")
 
-class Session():
+class Session(SessionStruct):
     """
     Represents a session of events, with a start and end state.
 
@@ -101,7 +102,10 @@ class Session():
 
     """
 
+    def __init__(self, **kwargs):
+        pass
 
+    # If ever wanting to safely use __dict__ for serialization, uncomment the below
     # __slots__ = [
     #     "session_id",
     #     "init_timestamp",
@@ -117,21 +121,12 @@ class Session():
     # ]
 
 
-    LOCK_LYFC: Annotated[threading.Lock, "Lock lifecycle operations; consumed during start/stop cycles"]
-    # LOCK
-
     thread: Annotated[EventDisptcherThread, ("Publishes events to the API in a background thread."
                                              "TODO: an eventual async support release won't need a Thread; "
                                              "instead attach to existing loop executor. Plan for support")]
 
     locks: Dict[Literal['lifecycle', 'events', 'session', 'tags'], threading.Lock]
 
-    d: SessionPayload
-
-
-    def asdict(self) -> Dict[str, Any]:
-        """Forwards retrieval to @dataclass entity"""
-        return self.d.asdict()
 
     def __init__(
         self,
@@ -140,35 +135,16 @@ class Session():
         tags: Optional[List[str]] = None,
         host_env: Optional[dict] = None,
     ):
-        self.session_id = session_id
-        self.tags: List[str] = tags or []
-        self.video: Optional[str] = None
-        self.end_state_reason: Optional[str] = None
-        self.host_env = host_env
-        self.config = config
+        self.packet = None
         self.jwt = None
-        # self.lock = threading.Lock()  # Only use for core operations
-        # self.runtime_condition = threading.Condition(self.lock)
-        # self.cleanup_manage
+        
         self._events = queue.Queue[Event](self.config.max_queue_size)
-        # self._lock_lifecycle = threading.Lock()
-        # self.event_counts = {
-        #     "llms": 0,
-        #     "tools": 0,
-        #     "actions": 0,
-        #     "errors": 0,
-        #     "apis": 0,
-        # }
-
-
-        self.lock = {} # Could use a `defaultdict` but it's only thread-safe in CPython
-        for k in { 'lifecycle', 'events', 'session', 'tags' }:
-            # Pre-init the locks dictionary
-            # better safe than sorry
-            self.locks[k]
+        
+        self.locks = {}
+        for k in {'lifecycle', 'events', 'session', 'tags'}:
+            self.locks[k] = threading.Lock()
 
         self.thread = EventDisptcherThread(self)
-
         self.thread.start()
 
         self.is_running = self._start_session()
@@ -209,7 +185,6 @@ class Session():
         #     if not self.is_running or self.end_timestamp:
         #         return
         #
-        self.end_timestamp = end_timestamp = get_ISO_time()
         #     self.end_state_reason = end_state_reason
         #     if video is not None:
         #         self.video = video
@@ -222,7 +197,7 @@ class Session():
         self.end_state_reason = end_state_reason or self.end_state_reason
 
         # TODO: Privatize modifier by nomenclature
-        def __fmt():
+        def __duration():
             start = dt.datetime.fromisoformat(self.init_timestamp.replace("Z", "+00:00"))
             end = dt.datetime.fromisoformat(end_timestamp.replace("Z", "+00:00"))
             duration = end - start
@@ -253,7 +228,7 @@ class Session():
         logger.debug(res.body)
         token_cost = res.body.get("token_cost", "unknown")
 
-        formatted_duration = __fmt(self.init_timestamp, self.end_timestamp)
+        formatted_duration = __duration()
 
         if token_cost == "unknown" or token_cost is None:
             token_cost_d = Decimal(0)
@@ -354,11 +329,10 @@ class Session():
     def _enqueue(self, event: dict) -> None:
         # with self.events_buffer.mutex:
         self._events.queue.append(event)
-            self._events
-
-            if len(self._events) >= self.config.max_queue_size:
-                self._flush_queue()
-            self.condition.notify()
+        
+        if len(self._events) >= self.config.max_queue_size:
+            self._flush_queue()
+        self.condition.notify()
 
     def _reauthorize_jwt(self) -> Union[str, None]:
         with self.lock:
