@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import queue
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import (
@@ -314,18 +315,20 @@ class Session(SessionStruct):
         tags: Optional[List[str]] = None,
         host_env: Optional[dict] = None,
     ):
-        super().__init__(session_id=session_id, config=config, tags=tags, host_env=host_env)
+        super().__init__(
+            session_id=session_id, config=config, tags=tags, host_env=host_env
+        )
         self._events = queue.Queue[Event](self.config.max_queue_size)
         self._cleanup_done = False
-        
+
         # Initialize locks
         self.locks = {
             "lifecycle": threading.Lock(),  # Controls session lifecycle operations
-            "events": threading.Lock(),     # Protects event queue operations
-            "session": threading.Lock(),    # Protects session state updates
-            "tags": threading.Lock(),       # Protects tag modifications
+            "events": threading.Lock(),  # Protects event queue operations
+            "session": threading.Lock(),  # Protects session state updates
+            "tags": threading.Lock(),  # Protects tag modifications
         }
-        
+
         # Initialize conditions
         self.conditions = {
             "cleanup": threading.Condition(self.locks["lifecycle"]),
@@ -337,17 +340,17 @@ class Session(SessionStruct):
 
         self._is_running = False  # Protected state variable
         self.is_running = self._start_session()
-        
+
         if not self.is_running:
             self.stop()
 
-    @property 
+    @property
     def is_running(self) -> bool:
         """Thread-safe access to running state"""
         with self.locks["lifecycle"]:
             return self._is_running
 
-    @is_running.setter 
+    @is_running.setter
     def is_running(self, value: bool):
         """Thread-safe modification of running state"""
         with self.locks["lifecycle"]:
@@ -559,20 +562,20 @@ class Session(SessionStruct):
         with self.locks["lifecycle"]:
             if not self._is_running:
                 return
-            
+
             self._is_running = False
-            
+
             # Flush any remaining events
             with self.locks["events"]:
                 if not self._events.empty():
                     self._flush_queue()
-            
+
             # Signal the publisher thread to stop
             self.thread.stop()
-            
+
             # Wait for thread cleanup with timeout from config
             self.thread.join(timeout=self.config.graceful_shutdown_wait_time / 1000)
-            
+
             # Ensure session is properly ended
             if not self.end_timestamp:
                 try:
@@ -582,7 +585,7 @@ class Session(SessionStruct):
                     )
                 except Exception as e:
                     logger.error(f"Failed to end session during cleanup: {e}")
-            
+
             with self.conditions["cleanup"]:
                 self._cleanup_done = True
                 self.conditions["cleanup"].notify_all()
@@ -595,9 +598,9 @@ class Session(SessionStruct):
         with self.conditions["cleanup"]:
             if self._cleanup_done:
                 return
-            
+
             self.stop()
-            
+
             # Wait for cleanup to complete with configured timeout
             self.conditions["cleanup"].wait(
                 timeout=self.config.graceful_shutdown_wait_time / 1000
@@ -619,7 +622,7 @@ class Session(SessionStruct):
                     events.append(self._events.get_nowait())
                 except queue.Empty:
                     break
-            
+
             if events:
                 try:
                     self.batch(events)
@@ -681,26 +684,75 @@ class ChangesObserverThread(_SessionThread):
 
 
 class EventPublisherThread(_SessionThread):
-    """Polls events from Session, publishes API batches"""
+    """Polls events from Session and publishes them in batches"""
 
-    @property
-    def feed(self) -> queue.Queue:
-        return self.s._events
+    def __init__(self, session: Session):
+        super().__init__(session)
+        self._last_batch_time = time.monotonic()
+        self._batch = []
+        self._batch_lock = threading.Lock()
 
-    def run(self) -> None:  # virtual override
+    def run(self) -> None:
         """
-        `threading.Thread` invokes this on Thread.start()
-
-        Will poll for events
+        Main event publishing loop that handles batching based on:
+        - Maximum queue size
+        - Maximum time between batches
+        - Queue emptiness
         """
-        while True:
-            with self.poll:
-                if not self.s._events:
-                    self.s.runtime_condition.wait(
-                        timeout=self.s.config.max_wait_time / 1000
+        while not self.stopping:
+            current_time = time.monotonic()
+            should_publish = False
+
+            with self._batch_lock:
+                # Try to collect events up to max batch size
+                while len(self._batch) < self.s.config.max_queue_size:
+                    try:
+                        event = self.s._events.get_nowait()
+                        self._batch.append(event)
+                    except queue.Empty:
+                        break
+
+                # Determine if we should publish based on conditions
+                should_publish = (
+                    len(self._batch) >= self.s.config.max_queue_size
+                    or (  # Batch is full
+                        len(self._batch) > 0
+                        and current_time  # Have events and max time elapsed
+                        - self._last_batch_time
+                        >= self.s.config.max_wait_time / 1000
                     )
-                if self.s._events:
-                    self.s._flush_queue()
+                    or (
+                        len(self._batch) > 0 and self.s._events.empty()
+                    )  # Have events and queue is empty
+                )
+
+                if should_publish:
+                    try:
+                        # Create a snapshot of the current batch
+                        events_to_publish = self._batch[:]
+                        self.s.batch(events_to_publish)
+                        # Clear the batch only after successful publish
+                        self._batch.clear()
+                        self._last_batch_time = current_time
+                    except Exception as e:
+                        logger.error(f"Failed to publish event batch: {e}")
+                        # Events remain in batch to retry on next iteration
+
+            # Sleep briefly to prevent tight polling
+            time.sleep(0.1)
+
+    def stop(self) -> None:
+        """Ensure any remaining events are published before stopping"""
+        with self._batch_lock:
+            if self._batch:
+                try:
+                    self.s.batch(self._batch)
+                except Exception as e:
+                    logger.error(f"Failed to publish final batch during shutdown: {e}")
+                finally:
+                    self._batch.clear()
+
+        super().stop()
 
 
 # def _serialize_batch(self, events: List[dict]) -> bytes:
