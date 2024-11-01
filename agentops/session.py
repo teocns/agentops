@@ -1,24 +1,91 @@
+from __future__ import annotations  # Allow forward references
+
+import atexit
 import copy
+import datetime as dt
 import functools
 import json
+import queue
 import threading
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from termcolor import colored
-from typing import Optional, List, Union
+from typing import (Annotated, Any, ClassVar, Dict, Generator, List, Literal,
+                    Optional, Protocol, Type, Union, runtime_checkable)
 from uuid import UUID, uuid4
-from datetime import datetime
+from warnings import deprecated
 
-from .exceptions import ApiServerException
+from termcolor import colored
+
+from .config import Configuration
 from .enums import EndState
 from .event import ErrorEvent, Event
-from .log_config import logger
-from .config import Configuration
-from .helpers import get_ISO_time, filter_unjsonable, safe_serialize
+from .exceptions import ApiServerException
+from .helpers import filter_unjsonable, get_ISO_time, safe_serialize
 from .http_client import HttpClient
+from .log_config import logger
 
 
-class Session:
+@dataclass
+class EventsCounter:
+    llms: int = 0
+    tools: int = 0
+    actions: int = 0
+    errors: int = 0
+    apis: int = 0
+
+
+@dataclass
+class SessionPayload:
+    session_id: UUID
+    # --------------
+    config: Configuration
+    end_state: Literal["Success", "Fail", "Indeterminate"] = "Indeterminate" # TODO: Any other states, or is strict?
+    end_state_reason: Optional[str] = None
+    end_timestamp: Optional[str] = None
+    event_counts: dict = field(default_factory=lambda: defaultdict(int)) # Sets them to 0 by default
+    host_env: Optional[dict] = None
+    init_timestamp: str = field(default_factory=get_ISO_time)
+    is_running: bool = False
+    jwt: Optional[str] = None
+    tags: Optional[List[str]] = None
+    video: Optional[str] = None
+
+
+
+
+# @dataclasses.dataclass
+# class DataclassProtocol(Protocol):
+#     # as already noted in comments, checking for this attribute is currently
+#     # the most reliable way to ascertain that something is a dataclass
+#     __dataclass_fields__: ClassVar[Dict[str, Any]] 
+
+
+class _AsDictProvider(Protocol):
+    def asdict(self) -> Dict[str, Any]:
+        ...
+
+class SessionApiMixin(_AsDictProvider):
+    def _update_session(self) -> None:
+        # TODO: Should this rather assert that the session is running?
+        # This is true if we don't expect `_update_session` to be invoked if the session
+        # isn't running either
+        # if not self.is_running:
+        #     return
+        # with self.lock:
+        # with self.locks['payload']
+        payload = {"session": self.asdict()} # WARNING: This is very dangerous
+        try:
+            res = HttpClient.post(
+                f"{self.config.endpoint}/v2/update_session",
+                json.dumps(filter_unjsonable(payload)).encode("utf-8"),
+                jwt=self.jwt,
+            )
+        except ApiServerException as e:
+            return logger.error(f"Could not update session - {e}")
+
+class Session():
     """
     Represents a session of events, with a start and end state.
 
@@ -34,6 +101,38 @@ class Session:
 
     """
 
+
+    # __slots__ = [
+    #     "session_id",
+    #     "init_timestamp",
+    #     "end_timestamp",
+    #     "end_state",
+    #     "end_state_reason",
+    #     "tags",
+    #     "video",
+    #     "host_env",
+    #     "config",
+    #     "jwt",
+    #     "event_counts",
+    # ]
+
+
+    LOCK_LYFC: Annotated[threading.Lock, "Lock lifecycle operations; consumed during start/stop cycles"]
+    # LOCK
+
+    thread: Annotated[EventDisptcherThread, ("Publishes events to the API in a background thread."
+                                             "TODO: an eventual async support release won't need a Thread; "
+                                             "instead attach to existing loop executor. Plan for support")]
+
+    locks: Dict[Literal['lifecycle', 'events', 'session', 'tags'], threading.Lock]
+
+    d: SessionPayload
+
+
+    def asdict(self) -> Dict[str, Any]:
+        """Forwards retrieval to @dataclass entity"""
+        return self.d.asdict()
+
     def __init__(
         self,
         session_id: UUID,
@@ -41,29 +140,35 @@ class Session:
         tags: Optional[List[str]] = None,
         host_env: Optional[dict] = None,
     ):
-        self.end_timestamp = None
-        self.end_state: Optional[str] = "Indeterminate"
         self.session_id = session_id
-        self.init_timestamp = get_ISO_time()
         self.tags: List[str] = tags or []
         self.video: Optional[str] = None
         self.end_state_reason: Optional[str] = None
         self.host_env = host_env
         self.config = config
         self.jwt = None
-        self.lock = threading.Lock()
-        self.queue = []
-        self.event_counts = {
-            "llms": 0,
-            "tools": 0,
-            "actions": 0,
-            "errors": 0,
-            "apis": 0,
-        }
+        # self.lock = threading.Lock()  # Only use for core operations
+        # self.runtime_condition = threading.Condition(self.lock)
+        # self.cleanup_manage
+        self._events = queue.Queue[Event](self.config.max_queue_size)
+        # self._lock_lifecycle = threading.Lock()
+        # self.event_counts = {
+        #     "llms": 0,
+        #     "tools": 0,
+        #     "actions": 0,
+        #     "errors": 0,
+        #     "apis": 0,
+        # }
 
-        self.stop_flag = threading.Event()
-        self.thread = threading.Thread(target=self._run)
-        self.thread.daemon = True
+
+        self.lock = {} # Could use a `defaultdict` but it's only thread-safe in CPython
+        for k in { 'lifecycle', 'events', 'session', 'tags' }:
+            # Pre-init the locks dictionary
+            # better safe than sorry
+            self.locks[k]
+
+        self.thread = EventDisptcherThread(self)
+
         self.thread.start()
 
         self.is_running = self._start_session()
@@ -80,6 +185,8 @@ class Session:
         """
         self.video = video
 
+
+
     def end_session(
         self,
         end_state: str = "Indeterminate",
@@ -88,26 +195,36 @@ class Session:
     ) -> Union[Decimal, None]:
 
         if not self.is_running:
-            return
+            raise RuntimeError("Cannot end a terminated session")
 
         if not any(end_state == state.value for state in EndState):
             return logger.warning(
                 "Invalid end_state. Please use one of the EndState enums"
             )
 
-        self.end_timestamp = get_ISO_time()
-        self.end_state = end_state
-        self.end_state_reason = end_state_reason
-        if video is not None:
-            self.video = video
+        # if self._terminate:
+        #     raise RuntimeError("Cannot end a terminated session")
+        #
+        # with self.runtime_condition:  # This needs to lock because we don't expect end_session to end multiple times 
+        #     if not self.is_running or self.end_timestamp:
+        #         return
+        #
+        self.end_timestamp = end_timestamp = get_ISO_time()
+        #     self.end_state_reason = end_state_reason
+        #     if video is not None:
+        #         self.video = video
+        #
+        # self.stop_flag.set()
+        # self.thread.join(timeout=1)
+        # self._flush_queue()
 
-        self.stop_flag.set()
-        self.thread.join(timeout=1)
-        self._flush_queue()
+        self.end_state = end_state or self.end_state
+        self.end_state_reason = end_state_reason or self.end_state_reason
 
-        def format_duration(start_time, end_time):
-            start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        # TODO: Privatize modifier by nomenclature
+        def __fmt():
+            start = dt.datetime.fromisoformat(self.init_timestamp.replace("Z", "+00:00"))
+            end = dt.datetime.fromisoformat(end_timestamp.replace("Z", "+00:00"))
             duration = end - start
 
             hours, remainder = divmod(duration.total_seconds(), 3600)
@@ -122,8 +239,8 @@ class Session:
 
             return " ".join(parts)
 
-        with self.lock:
-            payload = {"session": self.__dict__}
+        with self.locks['api']:
+            payload = {"session": self.__dict__} # WARNING: This is very dangerous
             try:
                 res = HttpClient.post(
                     f"{self.config.endpoint}/v2/update_session",
@@ -136,7 +253,7 @@ class Session:
         logger.debug(res.body)
         token_cost = res.body.get("token_cost", "unknown")
 
-        formatted_duration = format_duration(self.init_timestamp, self.end_timestamp)
+        formatted_duration = __fmt(self.init_timestamp, self.end_timestamp)
 
         if token_cost == "unknown" or token_cost is None:
             token_cost_d = Decimal(0)
@@ -229,17 +346,19 @@ class Session:
 
                 event.trigger_event_id = event.trigger_event.id
                 event.trigger_event_type = event.trigger_event.event_type
-                self._add_event(event.trigger_event.__dict__)
+                self._enqueue(event.trigger_event.__dict__)
                 event.trigger_event = None  # removes trigger_event from serialization
 
-        self._add_event(event.__dict__)
+        self._enqueue(event.__dict__) # WARNING: This is very dangerous
 
-    def _add_event(self, event: dict) -> None:
-        with self.lock:
-            self.queue.append(event)
+    def _enqueue(self, event: dict) -> None:
+        # with self.events_buffer.mutex:
+        self._events.queue.append(event)
+            self._events
 
-            if len(self.queue) >= self.config.max_queue_size:
+            if len(self._events) >= self.config.max_queue_size:
                 self._flush_queue()
+            self.condition.notify()
 
     def _reauthorize_jwt(self) -> Union[str, None]:
         with self.lock:
@@ -260,9 +379,20 @@ class Session:
             self.jwt = jwt
             return jwt
 
+
+    @property
+    def queue(self) -> queue.Queue:
+        return self._queue.queue
+        # if not self.is_running:
+            # return
+        # self._events.put(event)
+
     def _start_session(self):
-        self.queue = []
-        with self.lock:
+        with self.lock['lifecycle']:
+            """
+            `lifecycle_lock` be acquired in two scenarios: starting and ending the session
+            """
+            self._queue = queue.Queue()
             payload = {"session": self.__dict__}
             serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
 
@@ -300,70 +430,64 @@ class Session:
 
             return True
 
-    def _update_session(self) -> None:
-        if not self.is_running:
-            return
-        with self.lock:
-            payload = {"session": self.__dict__}
 
-            try:
-                res = HttpClient.post(
-                    f"{self.config.endpoint}/v2/update_session",
-                    json.dumps(filter_unjsonable(payload)).encode("utf-8"),
-                    jwt=self.jwt,
-                )
-            except ApiServerException as e:
-                return logger.error(f"Could not update session - {e}")
 
-    def _flush_queue(self) -> None:
-        if not self.is_running:
-            return
-        with self.lock:
-            queue_copy = self.queue[:]  # Copy the current items
-            self.queue = []
 
-            if len(queue_copy) > 0:
-                payload = {
-                    "events": queue_copy,
-                }
+    def batch(
+            self, 
+            __batch_size: Annotated[Optional[int], "Maximum batch size"] = None,
+            /,
+            wait: Annotated[bool, "Will block if the queue is empty, only use if infinity is your limits"] = False,
+            timeout=None
+        ) -> Generator[Event, None, int]:
+        MAX_BATCH_SIZE =  max(__batch_size, self.config.max_queue_size) if __batch_size else self.config.max_queue_size
+        # safety measure to avoid a presumable infinite process
+        # whereas the queue keeps growing indefinitely 
+        # (hence why docstrings try to warn you about 'queue' computed qsize/empty methods )
+        q_size = self._events.qsize()
+        buf = 0
+        while (
+            buf < MAX_BATCH_SIZE # Don't exceed configured max batch size
+        ) and (
+            buf < q_size # Don't exceed the queue size
+        ):
+            yield self._events.get(block=wait) 
+            buf+=1
 
-                serialized_payload = safe_serialize(payload).encode("utf-8")
-                try:
-                    HttpClient.post(
-                        f"{self.config.endpoint}/v2/create_events",
-                        serialized_payload,
-                        jwt=self.jwt,
-                    )
-                except ApiServerException as e:
-                    return logger.error(f"Could not post events - {e}")
+        return q_size - buf # Return remaining items
 
-                logger.debug("\n<AGENTOPS_DEBUG_OUTPUT>")
-                logger.debug(
-                    f"Session request to {self.config.endpoint}/v2/create_events"
-                )
-                logger.debug(serialized_payload)
-                logger.debug("</AGENTOPS_DEBUG_OUTPUT>\n")
 
-                # Count total events created based on type
-                events = payload["events"]
-                for event in events:
-                    event_type = event["event_type"]
-                    if event_type == "llms":
-                        self.event_counts["llms"] += 1
-                    elif event_type == "tools":
-                        self.event_counts["tools"] += 1
-                    elif event_type == "actions":
-                        self.event_counts["actions"] += 1
-                    elif event_type == "errors":
-                        self.event_counts["errors"] += 1
-                    elif event_type == "apis":
-                        self.event_counts["apis"] += 1
+    def dispatch(self, events: List[dict]) -> None:
+        """
+        Dispatches a batch of events to the API using buffered serialization
+        
+        Args:
+            events (List[dict]): List of events to dispatch
+        """
 
-    def _run(self) -> None:
-        while not self.stop_flag.is_set():
-            time.sleep(self.config.max_wait_time / 1000)
-            if self.queue:
-                self._flush_queue()
+        # INFO: Consider whether the below might be good replacements for `safe_serialize`
+        # - https://github.com/aviramha/ormsgpack | For fast a.f serialization w/ msgpack + orjson
+        # - https://docs.pydantic.dev/latest/api/pydantic_core/#pydantic_core.to_jsonable_python | for a builtin pydantic encoder
+        serialized_payload = safe_serialize(dict(events=events)).encode("utf-8")
+        try:
+            HttpClient.post(
+                f"{self.config.endpoint}/v2/create_events",
+                serialized_payload,
+                jwt=self.jwt,
+            )
+        except ApiServerException as e:
+            return logger.error(f"Could not post events - {e}")
+
+        # Update event counts
+        for event in events:
+            event_type = event.get("event_type")
+            if event_type in self.event_counts:
+                self.event_counts[event_type] += 1
+
+        logger.debug("\n<AGENTOPS_DEBUG_OUTPUT>")
+        logger.debug(f"Session request to {self.config.endpoint}/v2/create_events")
+        logger.debug(serialized_payload)
+        logger.debug("</AGENTOPS_DEBUG_OUTPUT>\n")
 
     def create_agent(self, name, agent_id):
         if not self.is_running:
@@ -396,5 +520,127 @@ class Session:
 
         return wrapper
 
+    @property
+    def is_running(self):
+        # Use the runtime condition to determine wheter we're running
+        try:
+            # If we can acquire it, then the session is NOT running
+            return not self.runtime_condition.acquire(blocking=False)
+        finally:
+            # Release it immediately
+            self.runtime_condition.release()
+
+    def _cleanup(self):
+        """
+        Ensure the cleanup of the session.
+
+        This method can run once per runtime to ensure that the session is properly cleaned up.
+        Once the cleanup_event has occurred, it can be assumed that the session is no longer running.
+        """
+        # :: Try to acquire the runtime lock, but don't Block if it is not free
+        # :: There is no reason to block because there's no reason to stack such events
+        if not self.runtime_condition.acquire(blocking=False):
+            # We can't perform a cleanup if there's no runtime
+            # return self.thread.join()
+            pass
+        try:
+            # if not self.
+            # if self.is_running and not self.end_timestamp: # Why do we need to check for the end_timestamp though?
+            # self.stop_flag.set() # FIXME: Does it need to show running?
+            # self.thread.join(timeout=0.1)
+
+            self.thread
+
+            self.dispatch()
+
+            try:
+                self.terminate(
+                    end_state="Indeterminate",
+                    end_state_reason="Session interrupted",
+                )
+            except:
+                pass
+
+            self.cleanup_condition.notify()
+
+            # self._cleanup_done = True
+            # self.is_running = False
+        finally:
+            if acquired:
+                self.condition.release()
+
+class EventDisptcherThread(threading.Thread):
+    """Thread to publish events to the API"""
+
+    def __init__(self, session: Session):
+        self.s = session
+        self.daemon = True
+        # self.empty_condition = threading.Condition()  # Notiies when the queue is empty
+        self.stop_requested = threading.Lock()
+
+    @property
+    def feed(self) -> queue.Queue:
+        return self.s._events
+
+    @property
+    def stopping(self) -> bool:
+        return self.stop_requested.locked()
+
+    @property
+    def running(self) -> bool:
+        return not self.stopping
+
+    def stop(self) -> None:
+        with self.stop_requested:
+            with self.s.runtime_condition:
+                if not self.s._events:
+                    self.s.runtime_condition.wait(
+                        timeout=self.s.config.max_wait_time / 1000
+                    )
+                if self.s._events:
+                    self.s._flush_queue()
+
+    def run(self) -> None:
+        while self.running:
+            with self.condition:
+                # if not self.events_buffer:
+                #     self.condition.wait(timeout=self.config.max_wait_time / 1000)
+                # if self.events_buffer:
+                #     self._flush_queue()
+
+
+
+def _serialize_batch(self, events: List[dict]) -> bytes:
+    """
+    Efficiently serialize a batch of events.
+    
+    Args:
+        events (List[dict]): List of event dictionaries to serialize
+        
+    Returns:
+        bytes: Serialized events payload ready for transmission
+    """
+    payload = {
+        "events": events,
+        "session_id": str(self.session_id),
+        "batch_size": len(events)
+    }
+    
+    # Pre-process the events to remove unwanted fields
+    for event in events:
+        if "trigger_event" in event:
+            # Handle trigger events specially to avoid circular references
+            trigger = event["trigger_event"]
+            if trigger:
+                event["trigger_event_id"] = trigger.get("id")
+                event["trigger_event_type"] = trigger.get("event_type")
+                del event["trigger_event"]
+    
+    return safe_serialize(payload).encode("utf-8")
+
 
 active_sessions: List[Session] = []
+
+__all__ = [
+    "Session"
+]
