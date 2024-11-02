@@ -130,19 +130,6 @@ class SessionStruct:
     video: Optional[str] = None
 
 
-@runtime_checkable
-class _SessionProto(Protocol):
-    """Protocol for internal Session attributes that shouldn't be part of the dataclass"""
-
-    locks: Dict[Literal["lifecycle", "events", "session", "tags"], threading.Lock]
-    config: Configuration
-    session_id: UUID
-
-    def asdict(self) -> Dict[str, Any]: ...
-
-    def is_running(self) -> bool: ...
-
-
 class SessionApi:
     """
     Solely focuses on interacting with the API
@@ -296,6 +283,7 @@ class Session(SessionStruct):
     #     "event_counts",
     # ]
 
+
     thread: Annotated[
         EventPublisherThread,
         (
@@ -341,7 +329,8 @@ class Session(SessionStruct):
         self.observer_thread = ChangesObserverThread(self)
 
         self._is_running = False
-        self.is_running = self._start_session()
+
+        self._start_session()
 
         if self.is_running:
             # Only start threads if session started successfully
@@ -447,12 +436,17 @@ class Session(SessionStruct):
 
         self.end_state = end_state or self.end_state
         self.end_state_reason = end_state_reason or self.end_state_reason
+        self.end_timestamp = get_ISO_time()  # Add this line to set the end timestamp
 
         def __calc_elapsed():
             start = dt.datetime.fromisoformat(
                 self.init_timestamp.replace("Z", "+00:00")
             )
-            end = dt.datetime.fromisoformat(end_timestamp.replace("Z", "+00:00"))
+            end = dt.datetime.fromisoformat(
+                self.end_timestamp.replace(
+                    "Z", "+00:00"
+                )  # Now self.end_timestamp is defined
+            )
             duration = end - start
 
             hours, remainder = divmod(duration.total_seconds(), 3600)
@@ -641,15 +635,6 @@ class Session(SessionStruct):
             if not cleanup_success:
                 logger.error("Session cleanup timed out")
 
-    def __enter__(self):
-        """Support for context manager protocol"""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Ensure cleanup on context exit"""
-        self.stop()
-        return False  # Don't suppress exceptions
-
     def __del__(self):
         """Ensure cleanup runs when object is garbage collected"""
         try:
@@ -672,6 +657,62 @@ class Session(SessionStruct):
                     self.batch(events)
                 except Exception as e:
                     logger.error(f"Failed to batch events during flush: {e}")
+
+    def _start_session(self) -> bool:
+        """
+        Initializes and starts the session via API call.
+        Thread-safe method that sets up initial session state.
+        
+        Returns:
+            bool: True if session started successfully, False otherwise
+        """
+        with self.locks["lifecycle"]:
+            if self._is_running:
+                logger.warning("Session already running")
+                return True
+                
+            # Prepare session payload
+            payload = {"session": asdict(self)}  # Using dataclass asdict instead of __dict__
+            serialized_payload = json.dumps(filter_unjsonable(payload)).encode("utf-8")
+            
+            try:
+                res = HttpClient.post(
+                    f"{self.config.endpoint}/v2/create_session",
+                    serialized_payload,
+                    self.config.api_key,
+                    self.config.parent_key,
+                )
+            except ApiServerException as e:
+                logger.error(f"Could not start session - {e}")
+                return False
+                
+            if res.code != 200:
+                return False
+                
+            # Extract and validate JWT
+            jwt = res.body.get("jwt")
+            if not jwt:
+                logger.error("No JWT received from server")
+                return False
+                
+            self.jwt = jwt
+            
+            # Log session URL
+            session_url = res.body.get(
+                "session_url",
+                f"https://app.agentops.ai/drilldown?session_id={self.session_id}",
+            )
+            
+            logger.info(
+                colored(
+                    f"\x1b[34mSession Replay: {session_url}\x1b[0m",
+                    "blue",
+                )
+            )
+            
+            # Set running state only after successful initialization
+            self._is_running = True
+            return True
 
 
 class _SessionThread(threading.Thread):
@@ -825,12 +866,6 @@ __all__ = ["Session"]
 
 
 if __name__ == "__main__":
-    # Using as context manager (recommended)
-    with Session(uuid4(), config=Configuration()) as session:
-        # Use session...
-        pass  # Cleanup happens automatically
-
-    # Manual management
     session = Session(uuid4(), config=Configuration())
     try:
         # Use session...
