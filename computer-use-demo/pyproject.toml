@@ -1,8 +1,42 @@
-[tool.pyright]
-venvPath = "."
-venv = ".venv"
-useLibraryCodeForTypes = false
+[project]
+name = "computer-use-demo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit>=1.38.0",
+  "anthropic[bedrock,vertex]>=0.37.1",
+  "jsonschema==4.22.0",
+  "boto3>=1.28.57",
+  "google-auth<3,>=2",
+  "requests>=2.0.0,<3.0.0",
+  "psutil==5.9.8",
+  "packaging==23.2",
+  "termcolor>=2.3.0",
+  "PyYAML>=5.3,<7.0",
+  "agentops"
+]
 
-[tool.pytest.ini_options]
-pythonpath = "."
-asyncio_mode = "auto"
+[tool.uv.workspace]
+# agentops = { path = "./agentops" }
+members = [
+  # "computer-use-demo"
+  "agentops"
+]
+
+[tool.uv.sources]
+agentops = { workspace = true }
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+# packages = ["uvflow/edge/core", "uvflow/clients","uvflow/common","uvflow/configs"]
+packages = ["computer_use_demo"]

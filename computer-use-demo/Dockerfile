@@ -87,8 +87,24 @@ RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0
     python -m pip config set global.disable-pip-version-check true
 
 # only reinstall if requirements.txt changes
-COPY --chown=$USERNAME:$USERNAME computer_use_demo/requirements.txt $HOME/computer_use_demo/requirements.txt
-RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
+# COPY --chown=$USERNAME:$USERNAME computer_use_demo/requirements.txt $HOME/computer_use_demo/requirements.txt
+# RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
+
+
+
+# COPY $HOME/computer_use_demo $HOME/computer_use_demo
+# COPY
+
+RUN pip install -U uv 
+
+WORKDIR /package
+
+COPY --chown=$USERNAME:USERNAME . .
+
+RUN uv pip install --system -e .
+
+WORKDIR $HOME
+# RUN pip install --index-path dist/ --pre  agentops computer_use_demo
 
 # setup desktop env & app
 COPY --chown=$USERNAME:$USERNAME image/ $HOME

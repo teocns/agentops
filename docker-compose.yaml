@@ -1,0 +1,24 @@
+services:
+  computer-use-demo:
+    build:
+      context: ./computer-use-demo
+      dockerfile: ./Dockerfile
+    # entrypoint: /bin/bash
+    entrypoint: /home/computeruse/entrypoint.sh
+    # tty: true
+    # stdin_open: true
+    # command: sleep infinity
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+      - "5900:5900"
+      - "6080:6080"
+      - "8501:8501"
+      - "5678:5678"
+    volumes:
+      - ./computer-use-demo/computer_use_demo:/home/computeruse/computer_use_demo/
+      - ./computer-use-demo/agentops/agentops:/package/agentops/
+      - ./computer-use-demo/image/entrypoint.sh:/home/computeruse/entrypoint.sh
+
+

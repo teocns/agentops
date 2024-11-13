@@ -1,6 +1,7 @@
 import os
 import socket
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+import debugpy
 
 
 class HTTPServerV6(HTTPServer):
@@ -8,8 +9,12 @@ class HTTPServerV6(HTTPServer):
 
 
 def run_server():
+
+    import pdb; pdb.set_trace()  # Add this line at the start of run_server
+    
     os.chdir(os.path.dirname(__file__) + "/static_content")
     server_address = ("::", 8080)
+
     httpd = HTTPServerV6(server_address, SimpleHTTPRequestHandler)
     print("Starting HTTP server on port 8080...")  # noqa: T201
     httpd.serve_forever()

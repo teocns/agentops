@@ -33,7 +33,9 @@ from .tools import BashTool, ComputerTool, EditTool, ToolCollection, ToolResult
 
 import agentops
 
-agentops.init(api_key="ff21ec62-f686-459f-b642-62a8105f6ae8")
+import os
+
+agentops.init(api_key=os.environ['AGENTOPS_API_KEY'])
 
 # import debugpy
 # debugpy.listen(5678)
@@ -112,6 +114,7 @@ async def sampling_loop(
     )
 
     while True:
+        import pdb; pdb.set_trace()  # Add this line at the start of run_server
         enable_prompt_caching = False
         betas = [COMPUTER_USE_BETA_FLAG]
         image_truncation_threshold = 10
@@ -141,8 +144,9 @@ async def sampling_loop(
         # we use raw_response to provide debug information to streamlit. Your
         # implementation may be able call the SDK directly with:
         # `response = client.messages.create(...)` instead.
+        import pdb; pdb.set_trace()  # Add this line at the start of run_server
         try:
-            raw_response = client.beta.messages.with_raw_response.create(
+            raw_response = client.beta.messages.create(
                 max_tokens=max_tokens,
                 messages=messages,
                 model=model,
